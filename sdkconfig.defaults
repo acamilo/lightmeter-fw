@@ -1,0 +1,11 @@
+CONFIG_IDF_TARGET="esp32h2"
+
+# Console over CP2102N on UART0
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
+
+# Smaller default log level for cleaner CSV stream
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# Keep the door open for esp-zigbee-sdk integration later (requires 802.15.4).
+# Not enabling the radio yet; just leaving hints in the config.

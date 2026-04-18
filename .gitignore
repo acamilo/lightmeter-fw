@@ -1,0 +1,16 @@
+build/
+managed_components/
+sdkconfig
+sdkconfig.old
+dependencies.lock
+.vscode/
+*.bin
+*.elf
+*.map
+.DS_Store
+
+# CLAUDE.md contains private dev-environment details (infra IPs, MACs,
+# order numbers, host paths). Kept locally for my own workflow; never
+# commit. Add any future PII-laden notes to this ignore block.
+CLAUDE.md
+
