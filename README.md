@@ -52,14 +52,16 @@ Each endpoint is advertised as an HA Simple Sensor (device ID 0x000C) with Basic
 
 ## Output
 
-CSV on UART0 @ 115200 (for debug alongside the Zigbee stream):
+CSV on UART0 @ 115200 mirrors the Zigbee data — one row per read at ~0.5 Hz, same column order as the endpoint table above:
 
 ```
-ts_ms,F1_415,F2_445,F3_480,F4_515,F5_555,F6_590,F7_630,F8_680,clear,nir,lux_est,zcl_mv
+ts_ms,F1 415nm PPFD umol/m2/s,F2 445nm PPFD umol/m2/s, ... ,PAR total PPFD umol/m2/s,Illuminance lux photopic
 ```
 
-`lux_est` is the rough illuminance estimate pushed into the Zigbee `MeasuredValue` attribute; `zcl_mv` is the ZCL-encoded value (`10000·log10(lux)+1`) that ZHA actually sees.
+Useful for sanity-checking without pairing to a ZHA coordinator.
 
 ## Calibration TODO
 
-The current lux estimate is a single-point calibration on the clear channel (1 count ≈ 8 lux at 512× gain, ~281 ms integration) that I eyeballed against typical indoor lighting. For anything past "ballpark" accuracy, replace `clear_counts_to_lux()` in `main/main.c` with a photopic-weighted sum of F2…F8 and a proper reference-meter calibration.
+Per-band responsivity coefficients (`responsivity_basic[]` in `main/main.c`) are AS7341 datasheet-typical values normalized into the k0i05 basic-counts domain — expect accuracy within a factor of ~2. For anything better, single-point-calibrate each band against a reference meter (Apogee MQ-500 / LI-COR LI-250 / similar) under a known PAR source, then scale each `responsivity_basic[i]` by `(firmware_umol / reference_umol)`.
+
+The photopic lux channel (EP 10) uses CIE 1931 V(λ) weights sampled at the AS7341 band centers, with each band treated as a delta at its center wavelength — approximate, but sufficient for cross-checking PPFD channels against an ordinary lux meter.
