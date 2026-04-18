@@ -1,7 +1,7 @@
 #include <math.h>
 #include <stdio.h>
-#include <inttypes.h>
 #include <string.h>
+#include <inttypes.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -24,14 +24,10 @@ static const char *TAG = "lightmeter";
 
 #define AS7341_I2C_ADDR         0x39
 #define I2C_PROBE_TIMEOUT_MS    50
-#define READ_INTERVAL_MS        2000   // Zigbee report cadence
+#define READ_INTERVAL_MS        2000
 
 typedef struct { gpio_num_t a; gpio_num_t b; } pin_pair_t;
 
-// Candidate SDA/SCL pairs probed on boot in both polarities. Covers the
-// Arduino-ESP32 default for this variant plus the header-adjacent pairs
-// people commonly use for breadboard wiring. Avoids strapping pins (8/9),
-// the UART0 console pins (23/24), and the native USB pins (25/26/27).
 static const pin_pair_t candidate_pairs[] = {
     { GPIO_NUM_12, GPIO_NUM_22 },
     { GPIO_NUM_4,  GPIO_NUM_5  },
@@ -84,31 +80,91 @@ static esp_err_t sensor_bringup(void) {
     return as7341_init(g_bus, &dev_cfg, &g_sensor);
 }
 
-// --- Lux estimation + ZCL encoding -------------------------------------------
+// --- Channel table & photometric math ---------------------------------------
 
-// Rough lux estimate from the AS7341 clear channel. Empirical single-point
-// calibration: at 512x gain / 281 ms integration, 1 clear count ≈ 8 lux in
-// warm-white indoor light. TODO: replace with a proper photopic-weighted
-// sum of F2..F8 and a reference-meter calibration.
-static float clear_counts_to_lux(uint16_t clear_counts) {
-    const float LUX_PER_COUNT = 8.0f;
-    return (float)clear_counts * LUX_PER_COUNT;
+#define NUM_CHANNELS 10
+#define ENDPOINT_BASE 1   // EP IDs run 1..NUM_CHANNELS
+
+typedef enum {
+    CH_MODE_BAND_PPFD,   // PPFD contribution of a single F1..F8 band
+    CH_MODE_PAR_TOTAL,   // sum of F1..F8 PPFD
+    CH_MODE_LUX,         // photopic-weighted illuminance
+} channel_mode_t;
+
+typedef struct {
+    uint16_t       wavelength_nm;   // 0 for aggregate channels
+    const char    *description;     // shown in ZCL Description attr
+    channel_mode_t mode;
+} channel_spec_t;
+
+// Ordered by endpoint ID (EP 1 = index 0).
+static const channel_spec_t channels[NUM_CHANNELS] = {
+    { 415, "F1 415nm PPFD umol/m2/s", CH_MODE_BAND_PPFD },
+    { 445, "F2 445nm PPFD umol/m2/s", CH_MODE_BAND_PPFD },
+    { 480, "F3 480nm PPFD umol/m2/s", CH_MODE_BAND_PPFD },
+    { 515, "F4 515nm PPFD umol/m2/s", CH_MODE_BAND_PPFD },
+    { 555, "F5 555nm PPFD umol/m2/s", CH_MODE_BAND_PPFD },
+    { 590, "F6 590nm PPFD umol/m2/s", CH_MODE_BAND_PPFD },
+    { 630, "F7 630nm PPFD umol/m2/s", CH_MODE_BAND_PPFD },
+    { 680, "F8 680nm PPFD umol/m2/s", CH_MODE_BAND_PPFD },
+    {   0, "PAR total PPFD umol/m2/s", CH_MODE_PAR_TOTAL },
+    {   0, "Illuminance lux photopic", CH_MODE_LUX },
+};
+
+// AS7341 datasheet-typical responsivity in counts per (uW/cm^2), measured at
+// 128x gain / 50ms integration and re-normalized into the "basic counts"
+// domain used by the k0i05 driver. TODO: calibrate each band against a
+// reference meter; the shipped numbers are within a factor of ~2 at best.
+static const float responsivity_basic[8] = {
+    1.016f,  // F1 415nm
+    1.078f,  // F2 445nm
+    1.150f,  // F3 480nm
+    1.094f,  // F4 515nm
+    1.011f,  // F5 555nm
+    1.038f,  // F6 590nm
+    1.167f,  // F7 630nm
+    1.166f,  // F8 680nm
+};
+
+// CIE 1931 photopic luminosity function V(lambda) sampled at our band centers.
+static const float photopic_weight[8] = {
+    0.00158f, 0.0355f, 0.139f, 0.608f,
+    1.000f,   0.757f,  0.265f, 0.0170f,
+};
+
+// Converts AS7341 "basic counts" on a band to PPFD (umol/m^2/s).
+//   basic_counts / responsivity  =>  irradiance in uW/cm^2
+//   uW/cm^2 * 0.01               =>  W/m^2
+//   W/m^2  * lambda_nm / 119.6   =>  umol/m^2/s   (planck-relation per-band)
+static float band_to_ppfd(float basic_counts, int band_idx) {
+    float irradiance_uw_per_cm2 = basic_counts / responsivity_basic[band_idx];
+    float irradiance_w_per_m2   = irradiance_uw_per_cm2 * 0.01f;
+    return irradiance_w_per_m2 * (float)channels[band_idx].wavelength_nm / 119.6f;
 }
 
-// ZCL 0x0400 MeasuredValue = 10000 * log10(lux) + 1 (spec §4.2 Illum Meas).
-// 0x0000 means "too low", 0xFFFF means "invalid".
-static uint16_t lux_to_zcl_measured_value(float lux) {
-    if (lux <= 1.0f) return 0;
-    float mv = 10000.0f * log10f(lux) + 1.0f;
-    if (mv < 1.0f)      return 0;
-    if (mv > 0xFFFEu)   return 0xFFFEu;
-    return (uint16_t)mv;
+// Photopic-weighted lux estimate from F1..F8.
+//   lux = 683 * sum_i( V(lambda_i) * irradiance_i(W/m^2) )
+// Approximation: treats each AS7341 band as a delta at its center wavelength.
+// Real lux would integrate over the band shapes — fine for horticulture-grade
+// cross-checking against the PPFD channels, not for photometry certification.
+static float compute_lux(const float basic[8]) {
+    float sum = 0.0f;
+    for (int i = 0; i < 8; i++) {
+        float irr_w_m2 = (basic[i] / responsivity_basic[i]) * 0.01f;
+        sum += photopic_weight[i] * irr_w_m2;
+    }
+    return 683.0f * sum;
 }
 
 // --- Zigbee plumbing ---------------------------------------------------------
 
-#define LIGHT_SENSOR_ENDPOINT      1
 #define ESP_ZB_PRIMARY_CHANNEL_MASK ESP_ZB_TRANSCEIVER_ALL_CHANNELS_MASK
+
+// BACnet engineering-units enum value for "no_units" / generic. Zigbee's
+// fixed enum has no PPFD or lux-as-first-class; ZHA users typically
+// override the display unit on the HA entity anyway. The Description
+// attribute carries the real unit string.
+#define ENG_UNITS_NO_UNITS 95
 
 static void start_network_steering(uint8_t param) {
     (void)param;
@@ -129,13 +185,12 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
     case ESP_ZB_BDB_SIGNAL_DEVICE_REBOOT:
         if (err_status == ESP_OK) {
             if (esp_zb_bdb_is_factory_new()) {
-                ESP_LOGI(TAG, "Joining a Zigbee network (factory new, starting steering)...");
+                ESP_LOGI(TAG, "Joining a Zigbee network (factory new, starting steering)");
                 esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
             } else {
-                ESP_LOGI(TAG, "Rejoined existing network: short=0x%04x PAN=0x%04x ch=%d",
-                         esp_zb_get_short_address(),
-                         esp_zb_get_pan_id(),
-                         esp_zb_get_current_channel());
+                ESP_LOGI(TAG, "Rejoined existing network: PAN=0x%04x ch=%d short=0x%04x",
+                         esp_zb_get_pan_id(), esp_zb_get_current_channel(),
+                         esp_zb_get_short_address());
             }
         } else {
             ESP_LOGW(TAG, "Commissioning init failed (%s), retrying in 1s",
@@ -146,8 +201,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
     case ESP_ZB_BDB_SIGNAL_STEERING:
         if (err_status == ESP_OK) {
             ESP_LOGI(TAG, "Joined network: PAN=0x%04x ch=%d short=0x%04x",
-                     esp_zb_get_pan_id(),
-                     esp_zb_get_current_channel(),
+                     esp_zb_get_pan_id(), esp_zb_get_current_channel(),
                      esp_zb_get_short_address());
         } else {
             ESP_LOGW(TAG, "Steering failed (%s), retrying in 5s", esp_err_to_name(err_status));
@@ -162,6 +216,61 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
     }
 }
 
+// Build one endpoint: Basic + Identify + Analog Input (with Description +
+// EngineeringUnits). Each endpoint is presented as a "Simple Sensor" device.
+static void add_analog_endpoint(esp_zb_ep_list_t *ep_list, uint8_t ep_id,
+                                const char *description_str) {
+    esp_zb_cluster_list_t *cluster_list = esp_zb_zcl_cluster_list_create();
+
+    esp_zb_basic_cluster_cfg_t basic_cfg = {
+        .zcl_version  = ESP_ZB_ZCL_BASIC_ZCL_VERSION_DEFAULT_VALUE,
+        .power_source = ESP_ZB_ZCL_BASIC_POWER_SOURCE_DEFAULT_VALUE,
+    };
+    esp_zb_cluster_list_add_basic_cluster(
+        cluster_list,
+        esp_zb_basic_cluster_create(&basic_cfg),
+        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+
+    esp_zb_identify_cluster_cfg_t identify_cfg = {
+        .identify_time = ESP_ZB_ZCL_IDENTIFY_IDENTIFY_TIME_DEFAULT_VALUE,
+    };
+    esp_zb_cluster_list_add_identify_cluster(
+        cluster_list,
+        esp_zb_identify_cluster_create(&identify_cfg),
+        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+
+    esp_zb_analog_input_cluster_cfg_t ai_cfg = {
+        .out_of_service = false,
+        .present_value  = 0.0f,
+        .status_flags   = 0,
+    };
+    esp_zb_attribute_list_t *ai_attrs = esp_zb_analog_input_cluster_create(&ai_cfg);
+
+    // Description attribute is a ZCL character_string: [length byte][bytes...].
+    size_t desc_len = strlen(description_str);
+    if (desc_len > 32) desc_len = 32;  // Description attr spec caps at 32 chars
+    uint8_t desc_buf[33];
+    desc_buf[0] = (uint8_t)desc_len;
+    memcpy(&desc_buf[1], description_str, desc_len);
+    esp_zb_analog_input_cluster_add_attr(
+        ai_attrs, ESP_ZB_ZCL_ATTR_ANALOG_INPUT_DESCRIPTION_ID, desc_buf);
+
+    uint16_t eng_units = ENG_UNITS_NO_UNITS;
+    esp_zb_analog_input_cluster_add_attr(
+        ai_attrs, ESP_ZB_ZCL_ATTR_ANALOG_INPUT_ENGINEERING_UNITS_ID, &eng_units);
+
+    esp_zb_cluster_list_add_analog_input_cluster(
+        cluster_list, ai_attrs, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+
+    esp_zb_endpoint_config_t ep_cfg = {
+        .endpoint           = ep_id,
+        .app_profile_id     = ESP_ZB_AF_HA_PROFILE_ID,
+        .app_device_id      = ESP_ZB_HA_SIMPLE_SENSOR_DEVICE_ID,
+        .app_device_version = 0,
+    };
+    esp_zb_ep_list_add_ep(ep_list, cluster_list, ep_cfg);
+}
+
 static void esp_zb_task(void *pvParameters) {
     esp_zb_cfg_t zb_nwk_cfg = {
         .esp_zb_role         = ESP_ZB_DEVICE_TYPE_ED,
@@ -173,12 +282,10 @@ static void esp_zb_task(void *pvParameters) {
     };
     esp_zb_init(&zb_nwk_cfg);
 
-    // Note: esp-zigbee-sdk calls this a "light sensor" but the cluster list
-    // it builds is Basic + Identify + Illuminance Measurement — exactly the
-    // HA 0x0106 "Light Sensor" / ZHA Illuminance sensor profile.
-    esp_zb_light_sensor_cfg_t sensor_cfg = ESP_ZB_DEFAULT_LIGHT_SENSOR_CONFIG();
-    esp_zb_ep_list_t *ep_list =
-        esp_zb_light_sensor_ep_create(LIGHT_SENSOR_ENDPOINT, &sensor_cfg);
+    esp_zb_ep_list_t *ep_list = esp_zb_ep_list_create();
+    for (int i = 0; i < NUM_CHANNELS; i++) {
+        add_analog_endpoint(ep_list, (uint8_t)(ENDPOINT_BASE + i), channels[i].description);
+    }
     esp_zb_device_register(ep_list);
 
     esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);
@@ -188,32 +295,61 @@ static void esp_zb_task(void *pvParameters) {
 
 // --- Sensor loop --------------------------------------------------------------
 
+static void push_present_value(uint8_t ep_id, float value) {
+    esp_zb_lock_acquire(portMAX_DELAY);
+    esp_zb_zcl_set_attribute_val(
+        ep_id,
+        ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
+        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+        ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID,
+        &value,
+        false);
+    esp_zb_lock_release();
+}
+
 static void sensor_task(void *pvParameters) {
-    printf("ts_ms,F1_415,F2_445,F3_480,F4_515,F5_555,F6_590,F7_630,F8_680,clear,nir,lux_est,zcl_mv\n");
+    printf("ts_ms,");
+    for (int i = 0; i < NUM_CHANNELS; i++) printf("%s%s", channels[i].description, i == NUM_CHANNELS - 1 ? "\n" : ",");
+
     while (1) {
-        as7341_channels_spectral_data_t d;
-        esp_err_t r = as7341_get_spectral_measurements(g_sensor, &d);
-        if (r == ESP_OK) {
-            float lux        = clear_counts_to_lux(d.clear);
-            uint16_t zcl_mv  = lux_to_zcl_measured_value(lux);
-
-            printf("%" PRId64 ",%u,%u,%u,%u,%u,%u,%u,%u,%u,%u,%.1f,%u\n",
-                   esp_timer_get_time() / 1000,
-                   d.f1, d.f2, d.f3, d.f4, d.f5, d.f6, d.f7, d.f8,
-                   d.clear, d.nir, lux, zcl_mv);
-
-            esp_zb_lock_acquire(portMAX_DELAY);
-            esp_zb_zcl_set_attribute_val(
-                LIGHT_SENSOR_ENDPOINT,
-                ESP_ZB_ZCL_CLUSTER_ID_ILLUMINANCE_MEASUREMENT,
-                ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-                ESP_ZB_ZCL_ATTR_ILLUMINANCE_MEASUREMENT_MEASURED_VALUE_ID,
-                &zcl_mv,
-                false);
-            esp_zb_lock_release();
-        } else {
+        as7341_channels_spectral_data_t raw;
+        esp_err_t r = as7341_get_spectral_measurements(g_sensor, &raw);
+        if (r != ESP_OK) {
             ESP_LOGW(TAG, "AS7341 read failed: %s", esp_err_to_name(r));
+            vTaskDelay(pdMS_TO_TICKS(READ_INTERVAL_MS));
+            continue;
         }
+
+        as7341_channels_basic_counts_data_t basic;
+        r = as7341_get_basic_counts(g_sensor, raw, &basic);
+        if (r != ESP_OK) {
+            ESP_LOGW(TAG, "basic_counts conversion failed: %s", esp_err_to_name(r));
+            vTaskDelay(pdMS_TO_TICKS(READ_INTERVAL_MS));
+            continue;
+        }
+
+        float basic_by_band[8] = {
+            basic.f1, basic.f2, basic.f3, basic.f4,
+            basic.f5, basic.f6, basic.f7, basic.f8,
+        };
+
+        float values[NUM_CHANNELS];
+        float par_total = 0.0f;
+        for (int i = 0; i < 8; i++) {
+            values[i] = band_to_ppfd(basic_by_band[i], i);
+            par_total += values[i];
+        }
+        values[8] = par_total;
+        values[9] = compute_lux(basic_by_band);
+
+        printf("%" PRId64, esp_timer_get_time() / 1000);
+        for (int i = 0; i < NUM_CHANNELS; i++) printf(",%.3f", values[i]);
+        printf("\n");
+
+        for (int i = 0; i < NUM_CHANNELS; i++) {
+            push_present_value((uint8_t)(ENDPOINT_BASE + i), values[i]);
+        }
+
         vTaskDelay(pdMS_TO_TICKS(READ_INTERVAL_MS));
     }
 }
@@ -221,7 +357,7 @@ static void sensor_task(void *pvParameters) {
 // --- Boot --------------------------------------------------------------------
 
 void app_main(void) {
-    ESP_LOGI(TAG, "lightmeter boot — ESP-IDF + Zigbee end device");
+    ESP_LOGI(TAG, "lightmeter boot — %d-endpoint Analog Input, ZHA-compatible", NUM_CHANNELS);
 
     ESP_ERROR_CHECK(nvs_flash_init());
 
@@ -232,10 +368,10 @@ void app_main(void) {
     ESP_ERROR_CHECK(esp_zb_platform_config(&config));
 
     if (sensor_bringup() != ESP_OK) {
-        ESP_LOGE(TAG, "AS7341 bring-up failed — will still start Zigbee so the device is pairable");
+        ESP_LOGE(TAG, "AS7341 bring-up failed — Zigbee will still start so the device is pairable");
     }
 
-    xTaskCreate(esp_zb_task,  "zb_main",     4096, NULL, 5, NULL);
+    xTaskCreate(esp_zb_task, "zb_main", 4096, NULL, 5, NULL);
     if (g_sensor) {
         xTaskCreate(sensor_task, "sensor_task", 4096, NULL, 4, NULL);
     }
