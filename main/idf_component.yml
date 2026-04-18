@@ -1,3 +1,5 @@
 dependencies:
   idf: ">=5.3"
   k0i05/esp_as7341: "^1.2.7"
+  espressif/esp-zigbee-lib: "~1.6.0"
+  espressif/esp-zboss-lib: "~1.6.0"

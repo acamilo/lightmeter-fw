@@ -4,13 +4,34 @@ sdkconfig
 sdkconfig.old
 dependencies.lock
 .vscode/
+.idea/
 *.bin
 *.elf
 *.map
+*.log
 .DS_Store
 
-# CLAUDE.md contains private dev-environment details (infra IPs, MACs,
-# order numbers, host paths). Kept locally for my own workflow; never
-# commit. Add any future PII-laden notes to this ignore block.
+# Private dev notes / PII
+# CLAUDE.md holds internal infra (host IPs, MACs, order numbers, paths).
+# Other *.local.md are a convention for machine-specific scratch notes.
 CLAUDE.md
+CLAUDE.local.md
+*.local.md
+NOTES.md
+.claude/
+
+# Secrets / credentials — defensive, not currently used
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+secrets/
+secrets.yaml
+credentials.json
+
+# Captured sensor data / debug traces — may contain location or context
+*.csv
+captures/
 
