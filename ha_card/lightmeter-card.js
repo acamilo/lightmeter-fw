@@ -79,7 +79,12 @@
       const validVals = values.filter((v) => v !== null);
       const scaleMax = Math.max(...validVals, 0.001);
 
-      const BW = 34, BS = 8, H = 140, LABELH = 40;
+      // TOP_PAD reserves space for the value label above each bar — without
+      // it, the tallest bar's label clips off the top of the SVG viewBox.
+      // H is the bar-drawing region; the full SVG height is TOP_PAD + H +
+      // LABELH (ticks below).
+      const BW = 34, BS = 8, H = 140, TOP_PAD = 14, LABELH = 24;
+      const BASELINE = TOP_PAD + H;
       const W = BANDS.length * (BW + BS) - BS;
       let bars = "", labels = "", ticks = "";
       BANDS.forEach((b, i) => {
@@ -87,13 +92,14 @@
         const x = i * (BW + BS);
         if (v !== null) {
           const h = Math.max(1, (v / scaleMax) * H);
-          bars += `<rect x="${x}" y="${H - h}" width="${BW}" height="${h}" fill="${b.color}" rx="3"/>`;
-          labels += `<text x="${x + BW / 2}" y="${H - h - 4}" class="val">${v.toFixed(2)}</text>`;
+          const y = BASELINE - h;
+          bars += `<rect x="${x}" y="${y}" width="${BW}" height="${h}" fill="${b.color}" rx="3"/>`;
+          labels += `<text x="${x + BW / 2}" y="${y - 4}" class="val">${v.toFixed(2)}</text>`;
         } else {
-          bars += `<rect x="${x}" y="${H - 6}" width="${BW}" height="4" fill="var(--disabled-text-color)" rx="2" opacity="0.4"/>`;
-          labels += `<text x="${x + BW / 2}" y="${H - 12}" class="val muted">—</text>`;
+          bars += `<rect x="${x}" y="${BASELINE - 6}" width="${BW}" height="4" fill="var(--disabled-text-color)" rx="2" opacity="0.4"/>`;
+          labels += `<text x="${x + BW / 2}" y="${BASELINE - 12}" class="val muted">—</text>`;
         }
-        ticks += `<text x="${x + BW / 2}" y="${H + 16}" class="tick">${b.label}</text>`;
+        ticks += `<text x="${x + BW / 2}" y="${BASELINE + 16}" class="tick">${b.label}</text>`;
       });
 
       const warn = (on, label) => `
@@ -139,7 +145,7 @@
               </div>
             </div>
             <div class="chart">
-              <svg viewBox="0 0 ${W} ${H + LABELH}" preserveAspectRatio="xMidYMid meet">
+              <svg viewBox="0 0 ${W} ${TOP_PAD + H + LABELH}" preserveAspectRatio="xMidYMid meet">
                 ${bars}
                 ${labels}
                 ${ticks}
