@@ -45,7 +45,7 @@ On boot the firmware scans a list of candidate I²C pin pairs (`{12,22}`, `{4,5}
 | 12 | **Binary Input** | `Flicker 100/120Hz detected` | bool |
 | 13 | **Binary Input** | `Spectral channel saturated` | bool |
 
-Every endpoint is advertised as an HA Simple Sensor (device ID 0x000C) with Basic + Identify + either Analog Input (0x000C) or Binary Input (0x000F). ZHA's `EngineeringUnits` slot on the analog endpoints is set to `no_units` (95) since ZCL's unit enum has no entry for µmol/m²/s or lux; the Description attribute carries the real unit string. To pretty up the unit label on the HA entity, either (a) customize the unit per-entity in HA, or (b) ship a `zha-device-handlers` quirk that overrides display units.
+Every endpoint is advertised as an HA Simple Sensor (device ID 0x000C) with Basic + Identify + either Analog Input (0x000C) or Binary Input (0x000F). ZHA's `EngineeringUnits` slot on the analog endpoints is set to `no_units` (95) since ZCL's unit enum has no entry for µmol/m²/s or lux; the Description attribute carries the real unit string. **In practice, ZHA's generic AnalogInput auto-discovery does not reliably surface multi-endpoint analog sensors as HA entities** — install the quirk in `zha_quirk/acamilo_lightmeter.py` (see below) to force explicit entity creation with the correct unit labels.
 
 **Flicker (EP 12)** goes `true` only when the AS7341's flicker engine locks onto 100 Hz or 120 Hz (mains-frequency light driver artifacts). `UNKNOWN` / `INVALID` states stay `false` — they mean "not locked yet," not "no flicker." Useful for grow-light QA.
 
@@ -66,6 +66,12 @@ ts_ms,F1 415nm PPFD umol/m2/s,F2 445nm PPFD umol/m2/s, ... ,PAR total PPFD umol/
 ```
 
 Useful for sanity-checking without pairing to a ZHA coordinator.
+
+## ZHA quirk (required for sensor entities to appear)
+
+Drop `zha_quirk/acamilo_lightmeter.py` into `<HA config>/custom_zha_quirks/` (create the directory if needed; point ZHA at it via the integration UI's "Custom quirks path" option, or `zha.configuration.custom_quirks_path` in `configuration.yaml`). Restart HA, remove the device from ZHA, erase-flash the firmware so it rejoins factory-new, and re-pair. After that, all 11 analog sensors and 2 binary sensors appear with the right units.
+
+Uses zigpy's v2 QuirkBuilder API (HA ≥ 2024.x). If your HA is older, the quirk needs porting to v1 `CustomDevice`.
 
 ## Over-the-air updates
 

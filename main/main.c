@@ -31,9 +31,16 @@
 // from future updates.
 #define LIGHTMETER_MANUFACTURER  0x1289
 #define LIGHTMETER_IMAGE_TYPE    0x0001
-#define LIGHTMETER_FW_VERSION    0x00000001   // bump for each release
+#define LIGHTMETER_FW_VERSION    0x00000002   // bump for each release
+
+// Shown in ZHA's "Manage Device" view and used by the matching quirk. These
+// are ZCL character strings so they get the usual length-byte prefix in RAM;
+// keep them short enough that the packed form fits the 32-byte attr limit.
+#define BASIC_MANUFACTURER_NAME  "Espressif"
+#define BASIC_MODEL_IDENTIFIER   "lightmeter"
 
 static void mark_image_valid_once(void);
+static void pack_zcl_string(const char *in, uint8_t *out, size_t out_capacity);
 
 static const char *TAG = "lightmeter";
 
@@ -329,8 +336,23 @@ static void add_basic_and_identify(esp_zb_cluster_list_t *cluster_list) {
         .zcl_version  = ESP_ZB_ZCL_BASIC_ZCL_VERSION_DEFAULT_VALUE,
         .power_source = ESP_ZB_ZCL_BASIC_POWER_SOURCE_DEFAULT_VALUE,
     };
+    esp_zb_attribute_list_t *basic_attrs = esp_zb_basic_cluster_create(&basic_cfg);
+
+    // Manufacturer + Model give the ZHA quirk a stable thing to match on.
+    // Without these, the Basic cluster reports blank strings and our quirk
+    // has nothing reliable to hook into, so ZHA falls back to its (flaky
+    // for multi-endpoint devices) generic AnalogInput discovery path.
+    uint8_t manuf_buf[1 + sizeof(BASIC_MANUFACTURER_NAME)];
+    uint8_t model_buf[1 + sizeof(BASIC_MODEL_IDENTIFIER)];
+    pack_zcl_string(BASIC_MANUFACTURER_NAME, manuf_buf, sizeof(manuf_buf));
+    pack_zcl_string(BASIC_MODEL_IDENTIFIER,  model_buf, sizeof(model_buf));
+    esp_zb_basic_cluster_add_attr(basic_attrs,
+        ESP_ZB_ZCL_ATTR_BASIC_MANUFACTURER_NAME_ID, manuf_buf);
+    esp_zb_basic_cluster_add_attr(basic_attrs,
+        ESP_ZB_ZCL_ATTR_BASIC_MODEL_IDENTIFIER_ID, model_buf);
+
     esp_zb_cluster_list_add_basic_cluster(
-        cluster_list, esp_zb_basic_cluster_create(&basic_cfg),
+        cluster_list, basic_attrs,
         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
     esp_zb_identify_cluster_cfg_t identify_cfg = {
