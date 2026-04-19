@@ -31,7 +31,7 @@
 // from future updates.
 #define LIGHTMETER_MANUFACTURER  0x1289
 #define LIGHTMETER_IMAGE_TYPE    0x0001
-#define LIGHTMETER_FW_VERSION    0x00000002   // bump for each release
+#define LIGHTMETER_FW_VERSION    0x00000003   // bump for each release
 
 // Shown in ZHA's "Manage Device" view and used by the matching quirk. These
 // are ZCL character strings so they get the usual length-byte prefix in RAM;
@@ -503,20 +503,50 @@ static void esp_zb_task(void *pvParameters) {
 
 // --- Sensor loop --------------------------------------------------------------
 
-static void push_analog(uint8_t ep_id, float value) {
+// Updates the local attribute value AND triggers an immediate ZCL Report
+// Attributes message toward bound destinations. ZHA's ConfigureReport default
+// for AnalogInput is 30/900/1 (min/max/delta), which makes values trickle
+// in. By spontaneously reporting on every sensor cycle we bypass that and
+// the coordinator sees updates at our sensor_task cadence (~0.5 Hz).
+static void push_and_report(uint8_t ep_id, uint16_t cluster_id, uint16_t attr_id, void *value) {
     esp_zb_lock_acquire(portMAX_DELAY);
     esp_zb_zcl_set_attribute_val(
-        ep_id, ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-        ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID, &value, false);
+        ep_id, cluster_id, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE, attr_id, value, false);
+
+    // Address explicitly to the coordinator on EP 1. Using addr_mode=0 (use
+    // binding table) means reports only flow if ZHA actually bound this
+    // specific (endpoint, cluster). In practice ZHA binds BinaryInput on
+    // EP 12/13 but not always AnalogInput on EP 1..11, which silently
+    // drops those reports. Explicit addressing bypasses that.
+    esp_zb_zcl_report_attr_cmd_t report = {
+        .zcl_basic_cmd = {
+            .src_endpoint = ep_id,
+            .dst_endpoint = 1,
+            .dst_addr_u   = { .addr_short = 0x0000 },
+        },
+        .address_mode     = ESP_ZB_APS_ADDR_MODE_16_ENDP_PRESENT,
+        .clusterID        = cluster_id,
+        .direction        = ESP_ZB_ZCL_CMD_DIRECTION_TO_CLI,
+        .dis_default_resp = 1,
+        .manuf_code       = 0,
+        .attributeID      = attr_id,
+    };
+    esp_err_t rc = esp_zb_zcl_report_attr_cmd_req(&report);
     esp_zb_lock_release();
+    if (rc != ESP_OK) {
+        ESP_LOGW(TAG, "report_attr_cmd_req ep=%u cluster=0x%04x attr=0x%04x rc=%s",
+                 ep_id, cluster_id, attr_id, esp_err_to_name(rc));
+    }
+}
+
+static void push_analog(uint8_t ep_id, float value) {
+    push_and_report(ep_id, ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
+                    ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID, &value);
 }
 
 static void push_binary(uint8_t ep_id, bool value) {
-    esp_zb_lock_acquire(portMAX_DELAY);
-    esp_zb_zcl_set_attribute_val(
-        ep_id, ESP_ZB_ZCL_CLUSTER_ID_BINARY_INPUT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-        ESP_ZB_ZCL_ATTR_BINARY_INPUT_PRESENT_VALUE_ID, &value, false);
-    esp_zb_lock_release();
+    push_and_report(ep_id, ESP_ZB_ZCL_CLUSTER_ID_BINARY_INPUT,
+                    ESP_ZB_ZCL_ATTR_BINARY_INPUT_PRESENT_VALUE_ID, &value);
 }
 
 static void sensor_task(void *pvParameters) {
