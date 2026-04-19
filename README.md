@@ -71,61 +71,108 @@ The device presents itself as a 13-endpoint ZHA device (`Espressif` / `lightmete
 
 Attribute reporting is configured at join-time: min 2 s, max 60 s, reportable change 0.1.
 
-## Home Assistant (ZHA) integration
+## Home Assistant integration
 
-ZHA's generic auto-discovery can match the AnalogInput clusters but doesn't always surface them as HA entities on multi-endpoint devices. The **quirk** in `zha_quirk/acamilo_lightmeter.py` fixes that by explicitly declaring one sensor per endpoint.
+Two pieces ship in this repo alongside the firmware:
 
-### One-time HA setup
+| Path | Purpose |
+|---|---|
+| `zha_quirk/acamilo_lightmeter.py` | zigpy v2 quirk — forces ZHA to create one sensor / binary_sensor entity per endpoint, which its generic AnalogInput auto-discovery won't do reliably for a 13-endpoint device. |
+| `ha_card/lightmeter-card.js` | Vanilla Lovelace custom card — renders the 9-band spectrum as coloured bars with PAR / lux headline numbers and flicker / saturation chips. Zero dependencies. |
 
-1. Copy `zha_quirk/acamilo_lightmeter.py` to `<HA config>/custom_zha_quirks/`.
-2. Add to `configuration.yaml`:
-   ```yaml
-   zha:
-     custom_quirks_path: /config/custom_zha_quirks
-   ```
-3. Restart HA Core.
+Both are optional — the device works as a plain ZHA sensor without them — but you want both for the full UX.
 
-### Pairing
+### Prerequisites
 
-1. In HA: Settings → Devices & Services → ZHA → **Add device** (60 s permit-join).
-2. Power-cycle the lightmeter. Factory-new devices find the network and join automatically; no install code needed.
-3. The device appears as `Espressif lightmeter` with 11 sensors + 2 diagnostic binary_sensors, one per endpoint.
+- HA 2024.4+ for the v2 QuirkBuilder API (older versions need the v1 `CustomDevice` pattern — ask).
+- A working ZHA coordinator already paired with HA.
+- Filesystem access to `/config/` on the HA host. The **Official "Terminal & SSH" add-on** works for this; so does the **File editor** add-on if you'd rather do it in the browser.
+
+### 1. Drop the files
+
+From a checkout of this repo, with SSH to your HA host (replace the address and user):
+
+```sh
+# quirk — goes next to HA's config so zigpy discovers it
+ssh user@ha.local 'sudo mkdir -p /config/custom_zha_quirks'
+scp zha_quirk/acamilo_lightmeter.py user@ha.local:/tmp/
+ssh user@ha.local 'sudo mv /tmp/acamilo_lightmeter.py /config/custom_zha_quirks/'
+
+# card — served out of HA's www/ as /local/…
+scp ha_card/lightmeter-card.js user@ha.local:/tmp/
+ssh user@ha.local 'sudo mkdir -p /config/www && sudo mv /tmp/lightmeter-card.js /config/www/'
+```
+
+If you're using the **File editor** add-on instead: paste the contents of each file into `custom_zha_quirks/acamilo_lightmeter.py` and `www/lightmeter-card.js` via the web editor, creating the directories as needed.
+
+### 2. Point ZHA at the custom quirks path
+
+Add this to `configuration.yaml` (if the `zha:` block already exists, just add the key under it):
+
+```yaml
+zha:
+  custom_quirks_path: /config/custom_zha_quirks
+```
+
+### 3. Register the card as a Lovelace resource
+
+**Settings → Dashboards → ⋮ → Resources → Add resource**
+
+- URL: `/local/lightmeter-card.js`
+- Resource type: **JavaScript module**
+
+(Storage-mode dashboards only. YAML-mode dashboards: add the same URL under `lovelace.resources` in `configuration.yaml` instead.)
+
+### 4. Restart HA Core
+
+**Settings → System → Restart Home Assistant → Restart Home Assistant Core**, or from a shell with supervisor access: `ha core restart`.
+
+### 5. Pair the device
+
+1. **Settings → Devices & Services → ZHA → Add device.** Permit-join opens for 60 s.
+2. Power-cycle the lightmeter. It boots factory-new, finds the network, and joins automatically — no install code.
+3. The device appears as **Espressif lightmeter** with 11 `sensor.*` entities and 2 `binary_sensor.*` (diagnostic) entities — one per endpoint. The quirk sets friendly names per band.
+
+If you previously paired the device **without** the quirk installed, remove the device first (its cached cluster metadata won't pick up the quirk otherwise), then re-pair.
+
+### 6. Add the card to a dashboard
+
+Dashboard → Edit → **+ Add card** → scroll to **Manual** → paste:
+
+```yaml
+type: custom:lightmeter-card
+```
+
+Optional config keys:
+
+```yaml
+type: custom:lightmeter-card
+title: Grow Room Spectrum
+entity_base: sensor.espressif_lightmeter
+binary_base: binary_sensor.espressif_lightmeter
+```
 
 ### Unit labels
 
-ZHA's unit system rejects arbitrary strings, so the µmol/m²/s channels appear without a default unit. To set it:
+ZHA's unit system rejects arbitrary strings, so the µmol/m²/s channels appear without a default unit (only the lux channel gets `lx` automatically). Two fixes:
 
-- Per entity, via the HA UI: click the entity → ⚙ Settings → set **Unit of measurement** to `µmol/m²/s`.
+- **Per entity**, in the HA UI: click the entity → ⚙ Settings → set **Unit of measurement** to `µmol/m²/s`. Do this once per PPFD entity.
+- **Bulk**, via the REST API (requires a long-lived access token):
+  ```sh
+  TOKEN=...
+  for ent in f1_415nm_ppfd f2_445nm_ppfd f3_480nm_ppfd f4_515nm_ppfd \
+             f5_555nm_ppfd f6_590nm_ppfd f7_630nm_ppfd f8_680nm_ppfd \
+             par_total nir_910nm_pfd; do
+      curl -X POST -H "Authorization: Bearer $TOKEN" \
+           -H "Content-Type: application/json" \
+           -d '{"unit_of_measurement":"µmol/m²/s"}' \
+           "http://<ha>:8123/api/config/entity_registry/sensor.espressif_lightmeter_$ent"
+  done
+  ```
 
-Or bulk-set all 10 via the HA REST API:
+### Updating either file
 
-```
-for ent in f1_415nm_ppfd f2_445nm_ppfd f3_480nm_ppfd f4_515nm_ppfd \
-           f5_555nm_ppfd f6_590nm_ppfd f7_630nm_ppfd f8_680nm_ppfd \
-           par_total nir_910nm_pfd; do
-    curl -X POST -H "Authorization: Bearer <long-lived-token>" \
-         -H "Content-Type: application/json" \
-         -d '{"unit_of_measurement":"µmol/m²/s"}' \
-         http://<ha>:8123/api/config/entity_registry/sensor.espressif_lightmeter_$ent
-done
-```
-
-The lux channel (EP 10) gets `lx` automatically via the `UnitOfIlluminance.LUX` enum.
-
-## Custom Lovelace card
-
-`ha_card/lightmeter-card.js` is a vanilla web component that renders the spectrum as a coloured bar chart with PAR / lux headline numbers and flicker / saturation indicators. No dependencies, drops into HA directly.
-
-Install:
-1. Copy `ha_card/lightmeter-card.js` into `<HA config>/www/`.
-2. Register as a Lovelace resource: Settings → Dashboards → ⋮ Resources → **Add**, URL `/local/lightmeter-card.js`, type **JavaScript Module**.
-3. Restart HA (or clear the browser's cache for the dashboard).
-4. On a dashboard, add a **Manual** card with:
-   ```yaml
-   type: custom:lightmeter-card
-   ```
-
-Override keys if your device name differs (`title`, `entity_base`, `binary_base`).
+After editing the quirk, restart HA so zigpy re-imports it. After editing the card, either hard-reload your browser (Ctrl+Shift+R) or bump the resource URL's cache-bust (`/local/lightmeter-card.js?v=N`) in the Lovelace resource settings.
 
 ## Zigbee2MQTT
 
