@@ -112,6 +112,21 @@ done
 
 The lux channel (EP 10) gets `lx` automatically via the `UnitOfIlluminance.LUX` enum.
 
+## Custom Lovelace card
+
+`ha_card/lightmeter-card.js` is a vanilla web component that renders the spectrum as a coloured bar chart with PAR / lux headline numbers and flicker / saturation indicators. No dependencies, drops into HA directly.
+
+Install:
+1. Copy `ha_card/lightmeter-card.js` into `<HA config>/www/`.
+2. Register as a Lovelace resource: Settings → Dashboards → ⋮ Resources → **Add**, URL `/local/lightmeter-card.js`, type **JavaScript Module**.
+3. Restart HA (or clear the browser's cache for the dashboard).
+4. On a dashboard, add a **Manual** card with:
+   ```yaml
+   type: custom:lightmeter-card
+   ```
+
+Override keys if your device name differs (`title`, `entity_base`, `binary_base`).
+
 ## Zigbee2MQTT
 
 A standards-compliant device — z2m picks it up, but its default `numeric` converter gives generic names. For pretty entities, a z2m external converter (similar scope to the ZHA quirk, ~80 lines of JS) is on the backlog.
