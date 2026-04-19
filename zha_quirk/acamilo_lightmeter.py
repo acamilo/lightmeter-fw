@@ -19,7 +19,7 @@ PPFD channels + NIR the unit is µmol/m²/s, which isn't in HA's catalog,
 so we leave `unit` unset and let the user customize it per entity in the
 UI. The photopic-illuminance channel gets the real lux enum.
 """
-from zigpy.quirks.v2 import QuirkBuilder
+from zigpy.quirks.v2 import QuirkBuilder, ReportingConfig
 try:
     from zigpy.quirks.v2.homeassistant import UnitOfIlluminance
 except ImportError:  # older/newer zigpy may name it differently
@@ -52,13 +52,25 @@ BINARY_CHANNELS = [
     (13, "spectral_saturated",  "Spectral channel saturated"),
 ]
 
+# Push ConfigureReporting on join so the coordinator gets pushed updates
+# instead of leaving PresentValue at "unknown" until it happens to poll.
+#   - analog channels: change-driven (delta=0.1) with a 60 s heartbeat
+#   - binary flags:    any transition, with a 5 min heartbeat
+ANALOG_REPORTING = ReportingConfig(
+    min_interval=2, max_interval=60, reportable_change=0.1,
+)
+BINARY_REPORTING = ReportingConfig(
+    min_interval=1, max_interval=300, reportable_change=1,
+)
+
 builder = QuirkBuilder(MANUFACTURER, MODEL)
 
 for ep, tkey, name, unit in ANALOG_CHANNELS:
     kwargs = {
-        "endpoint_id":     ep,
-        "translation_key": tkey,
-        "fallback_name":   name,
+        "endpoint_id":      ep,
+        "translation_key":  tkey,
+        "fallback_name":    name,
+        "reporting_config": ANALOG_REPORTING,
     }
     if unit is not None:
         kwargs["unit"] = unit
@@ -75,6 +87,7 @@ for ep, tkey, name in BINARY_CHANNELS:
         endpoint_id=ep,
         translation_key=tkey,
         fallback_name=name,
+        reporting_config=BINARY_REPORTING,
     )
 
 builder.add_to_registry()

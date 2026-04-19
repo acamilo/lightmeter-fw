@@ -1,121 +1,169 @@
 # lightmeter
 
-10-channel spectral light meter firmware for the Adafruit AS7341 (PID 4698) driven by an ESP32-H2-DevKitM-1 (PID 5715) over STEMMA QT / I²C. The H2 acts as a Zigbee end-device with **13 endpoints** — 11 Analog Input (F1..F8 per-band PPFD, PAR total, photopic lux, NIR) and 2 Binary Input (mains flicker detected, spectral saturation). ZHA auto-discovers each endpoint as its own sensor / binary_sensor entity.
+A 10-channel spectral light meter that reports per-band photosynthetic photon flux (PPFD), total PAR, photopic illuminance, flicker detection, and spectral saturation over Zigbee — compatible with Home Assistant ZHA, Zigbee2MQTT, and any other ZCL coordinator.
 
-## Build
-
-ESP-IDF v5.3 or newer, target `esp32h2`:
+Built on an Adafruit AS7341 sensor and an ESP32-H2-DevKitM-1. ESP-IDF firmware, no external cloud, OTA-capable once paired.
 
 ```
-idf.py set-target esp32h2
-idf.py build
-idf.py -p <serial port> flash monitor
+┌─────────────┐   I²C    ┌──────────────┐  802.15.4 (Zigbee 3.0)   ┌──────────┐
+│   AS7341    ├─────────►│   ESP32-H2   │◄────────────────────────►│  ZHA /   │──► HA
+│ (PID 4698)  │ 0x39     │ (PID 5715)   │                          │   z2m    │
+└─────────────┘          └──────────────┘                          └──────────┘
 ```
 
-The sensor driver is pulled automatically from the ESP Component Registry (`k0i05/esp_as7341`).
+## Bill of materials
+
+| Part | SKU | Notes |
+|---|---|---|
+| ESP32-H2-DevKitM-1 (4 MB flash) | Adafruit 5715 | RISC-V single core @ 96 MHz. BT 5 LE + IEEE 802.15.4. **No Wi-Fi**. USB via CP2102N. |
+| AS7341 10-channel spectral sensor | Adafruit 4698 | STEMMA QT / Qwiic. 8 visible bands (415–680 nm) + NIR (910 nm) + clear + flicker engine. |
+| STEMMA QT → male header pigtail, 150 mm | Adafruit 4209 | Breadboard glue. |
+
+Total material cost: ~$30.
 
 ## Wiring
-
-STEMMA QT cable (PID 4209) from the sensor's Qwiic port into the H2 header:
 
 | AS7341 | ESP32-H2 |
 |---|---|
 | VIN | 3V3 |
 | GND | GND |
-| SDA | any free GPIO |
+| SDA | any free GPIO (firmware auto-detects) |
 | SCL | any free GPIO |
 
-On boot the firmware scans a list of candidate I²C pin pairs (`{12,22}`, `{4,5}`, `{1,0}`, `{10,11}`, `{2,3}`) in both polarities until the sensor ACKs at 0x39. If you wire to a pair outside that list, add it to `candidate_pairs[]` in `main/main.c`.
+The firmware probes a list of candidate SDA/SCL pin pairs (`12/22`, `4/5`, `1/0`, `10/11`, `2/3`) in both polarities on boot and locks onto whichever one ACKs at 0x39. No menuconfig needed to match your wiring.
 
-## Endpoints exposed to ZHA
+## Build
 
-| Endpoint | Cluster | Description (ZCL attr 0x001C) | Unit |
+Prereqs: ESP-IDF v5.3+ (tested on 5.3.8), Python 3.10+.
+
+```
+git clone https://github.com/acamilo/lightmeter-fw
+cd lightmeter-fw
+idf.py set-target esp32h2
+idf.py build
+idf.py -p <serial port> flash monitor
+```
+
+The sensor driver (`k0i05/esp_as7341`) and Zigbee stack (`espressif/esp-zigbee-lib` + `esp-zboss-lib`) pull in automatically from the ESP Component Registry.
+
+### CSV debug stream
+
+Serial output at 115200 baud mirrors what goes over Zigbee, one line per sample:
+
+```
+ts_ms,F1 415nm PPFD,F2 445nm PPFD, ... ,PAR total,Illuminance lux,NIR 910nm PFD,flicker,saturated
+1476,0.000,0.000,0.000,0.065,0.302,0.417,0.569,0.374,1.728,114.735,0.000,0,0
+```
+
+## Zigbee entities exposed
+
+The device presents itself as a 13-endpoint ZHA device (`Espressif` / `lightmeter`, HA profile 0x0104, Simple Sensor 0x000C).
+
+| EP | Cluster | Description | Unit |
 |---:|---|---|---|
-| 1 | Analog Input | `F1 415nm PPFD umol/m2/s` | µmol/m²/s |
-| 2 | Analog Input | `F2 445nm PPFD umol/m2/s` | µmol/m²/s |
-| 3 | Analog Input | `F3 480nm PPFD umol/m2/s` | µmol/m²/s |
-| 4 | Analog Input | `F4 515nm PPFD umol/m2/s` | µmol/m²/s |
-| 5 | Analog Input | `F5 555nm PPFD umol/m2/s` | µmol/m²/s |
-| 6 | Analog Input | `F6 590nm PPFD umol/m2/s` | µmol/m²/s |
-| 7 | Analog Input | `F7 630nm PPFD umol/m2/s` | µmol/m²/s |
-| 8 | Analog Input | `F8 680nm PPFD umol/m2/s` | µmol/m²/s |
-| 9 | Analog Input | `PAR total PPFD umol/m2/s` | µmol/m²/s (sum of F1..F8) |
-| 10 | Analog Input | `Illuminance lux photopic` | lux |
-| 11 | Analog Input | `NIR 910nm PFD umol/m2/s` | µmol/m²/s |
-| 12 | **Binary Input** | `Flicker 100/120Hz detected` | bool |
-| 13 | **Binary Input** | `Spectral channel saturated` | bool |
+| 1 | AnalogInput + OTA (client) | F1 415 nm PPFD | µmol/m²/s |
+| 2–8 | AnalogInput | F2 445 / F3 480 / F4 515 / F5 555 / F6 590 / F7 630 / F8 680 nm PPFD | µmol/m²/s |
+| 9 | AnalogInput | PAR total (sum of F1..F8) | µmol/m²/s |
+| 10 | AnalogInput | Illuminance (photopic-weighted V(λ)) | lux |
+| 11 | AnalogInput | NIR 910 nm photon flux density | µmol/m²/s |
+| 12 | BinaryInput | Flicker 100/120 Hz detected | bool |
+| 13 | BinaryInput | Spectral channel saturated | bool |
 
-Every endpoint is advertised as an HA Simple Sensor (device ID 0x000C) with Basic + Identify + either Analog Input (0x000C) or Binary Input (0x000F). ZHA's `EngineeringUnits` slot on the analog endpoints is set to `no_units` (95) since ZCL's unit enum has no entry for µmol/m²/s or lux; the Description attribute carries the real unit string. **In practice, ZHA's generic AnalogInput auto-discovery does not reliably surface multi-endpoint analog sensors as HA entities** — install the quirk in `zha_quirk/acamilo_lightmeter.py` (see below) to force explicit entity creation with the correct unit labels.
+Attribute reporting is configured at join-time: min 2 s, max 60 s, reportable change 0.1.
 
-**Flicker (EP 12)** goes `true` only when the AS7341's flicker engine locks onto 100 Hz or 120 Hz (mains-frequency light driver artifacts). `UNKNOWN` / `INVALID` states stay `false` — they mean "not locked yet," not "no flicker." Useful for grow-light QA.
+## Home Assistant (ZHA) integration
 
-**Saturation (EP 13)** goes `true` if any of the spectral or flicker-detect channels saturate (analog or digital) on the most recent read — i.e., your spectral data is capped and therefore lies about the real light level. Treat any non-zero reading as a hint to drop gain or shorten integration.
+ZHA's generic auto-discovery can match the AnalogInput clusters but doesn't always surface them as HA entities on multi-endpoint devices. The **quirk** in `zha_quirk/acamilo_lightmeter.py` fixes that by explicitly declaring one sensor per endpoint.
 
-## Pairing to Home Assistant (ZHA)
+### One-time HA setup
 
-1. In Home Assistant: **Settings → Devices → ZHA → Add device**.
-2. Power-cycle or reset the lightmeter. It boots factory-new, scans all 802.15.4 channels, and joins automatically. No install code needed.
-3. Eleven `sensor.*` entities plus two `binary_sensor.*` entities appear under one device, one per endpoint. All update every 2 s; the coordinator also gets a heartbeat every 60 s via configured attribute reporting.
+1. Copy `zha_quirk/acamilo_lightmeter.py` to `<HA config>/custom_zha_quirks/`.
+2. Add to `configuration.yaml`:
+   ```yaml
+   zha:
+     custom_quirks_path: /config/custom_zha_quirks
+   ```
+3. Restart HA Core.
 
-## Output
+### Pairing
 
-CSV on UART0 @ 115200 mirrors the Zigbee data — one row per read at ~0.5 Hz, same column order as the endpoint table above:
+1. In HA: Settings → Devices & Services → ZHA → **Add device** (60 s permit-join).
+2. Power-cycle the lightmeter. Factory-new devices find the network and join automatically; no install code needed.
+3. The device appears as `Espressif lightmeter` with 11 sensors + 2 diagnostic binary_sensors, one per endpoint.
+
+### Unit labels
+
+ZHA's unit system rejects arbitrary strings, so the µmol/m²/s channels appear without a default unit. To set it:
+
+- Per entity, via the HA UI: click the entity → ⚙ Settings → set **Unit of measurement** to `µmol/m²/s`.
+
+Or bulk-set all 10 via the HA REST API:
 
 ```
-ts_ms,F1 415nm PPFD umol/m2/s,F2 445nm PPFD umol/m2/s, ... ,PAR total PPFD umol/m2/s,Illuminance lux photopic
+for ent in f1_415nm_ppfd f2_445nm_ppfd f3_480nm_ppfd f4_515nm_ppfd \
+           f5_555nm_ppfd f6_590nm_ppfd f7_630nm_ppfd f8_680nm_ppfd \
+           par_total nir_910nm_pfd; do
+    curl -X POST -H "Authorization: Bearer <long-lived-token>" \
+         -H "Content-Type: application/json" \
+         -d '{"unit_of_measurement":"µmol/m²/s"}' \
+         http://<ha>:8123/api/config/entity_registry/sensor.espressif_lightmeter_$ent
+done
 ```
 
-Useful for sanity-checking without pairing to a ZHA coordinator.
+The lux channel (EP 10) gets `lx` automatically via the `UnitOfIlluminance.LUX` enum.
 
-## ZHA quirk (required for sensor entities to appear)
+## Zigbee2MQTT
 
-Drop `zha_quirk/acamilo_lightmeter.py` into `<HA config>/custom_zha_quirks/` (create the directory if needed; point ZHA at it via the integration UI's "Custom quirks path" option, or `zha.configuration.custom_quirks_path` in `configuration.yaml`). Restart HA, remove the device from ZHA, erase-flash the firmware so it rejoins factory-new, and re-pair. After that, all 11 analog sensors and 2 binary sensors appear with the right units.
+A standards-compliant device — z2m picks it up, but its default `numeric` converter gives generic names. For pretty entities, a z2m external converter (similar scope to the ZHA quirk, ~80 lines of JS) is on the backlog.
 
-Uses zigpy's v2 QuirkBuilder API (HA ≥ 2024.x). If your HA is older, the quirk needs porting to v1 `CustomDevice`.
+## Over-the-air firmware updates
 
-## Over-the-air updates
+The device advertises the ZCL OTA Upgrade cluster (0x0019) on endpoint 1 with dual-slot (`ota_0`/`ota_1`, 960 KB each) plus bootloader rollback. Updates ride Zigbee — no USB cable after the first flash.
 
-The device advertises the standard **OTA Upgrade cluster (0x0019)** as a client on endpoint 1, with dual-slot `ota_0`/`ota_1` partitions and bootloader rollback enabled. ZHA, Zigbee2MQTT, and any other ZCL OTA server can push new firmware without a USB cable.
-
-**Identity** (must match between the device and the `.ota` file):
+### Identity
 
 | Field | Value |
 |---|---|
 | Manufacturer code | `0x1289` |
 | Image type | `0x0001` |
-| Current file version | `0x00000001` (bump in `main/main.c` each release) |
+| Current file version | `0x00000002` |
 
-### Build and package an update
+Bump `LIGHTMETER_FW_VERSION` in `main/main.c` with every release.
+
+### Release
 
 ```
 idf.py build
-scripts/make_ota.py build/lightmeter.bin lightmeter-v2.ota \
-    --manufacturer 0x1289 --image-type 0x0001 --version 0x00000002
+scripts/make_ota.py build/lightmeter.bin lightmeter-v3.ota \
+    --manufacturer 0x1289 --image-type 0x0001 --version 0x00000003
+# drop the .ota into <HA config>/zigbee_ota/ and reload ZHA
 ```
 
-`make_ota.py` wraps the ESP-IDF `.bin` in the ZCL OTA Upgrade File format (header + `Upgrade Image` sub-element). Bump `--version` for every release — the coordinator serves only images strictly newer than what the device reports.
+`make_ota.py` wraps an ESP-IDF `.bin` in the ZCL OTA Upgrade File format (header + single Upgrade Image sub-element). Expect 15–30 min per update over Zigbee. If the new image fails to rejoin within the rollback window, the bootloader reverts on next reset.
 
-### Deploying via ZHA
+## Calibration
 
-1. Place `lightmeter-v2.ota` in `<HA config>/zigbee_ota/` (or wherever your `zha.configuration.ota_providers` points).
-2. Restart HA or reload the ZHA integration.
-3. ZHA announces the new image; the device downloads over the air and reboots into it. Expect **15–30 minutes** on a healthy mesh for a ~500 KB image.
+Per-band responsivities in `main/main.c` (`responsivity_basic_f1_f8` and `responsivity_basic_nir`) are AS7341 datasheet-typical values normalized into the k0i05 driver's "basic counts" domain. Expect **factor-of-2 accuracy** until single-point-calibrated against a reference meter (Apogee MQ-500 / LI-COR LI-250 / similar). To calibrate: scale each coefficient by `(firmware_reading_umol / reference_umol)` for that band, bump the version, release an OTA.
 
-### Deploying via Zigbee2MQTT
+The photopic lux channel uses CIE 1931 V(λ) weights at the AS7341 band centers with each band treated as a delta at its center wavelength. Good enough to cross-check the PPFD channels against an ordinary lux meter, not certification-grade photometry.
 
-1. Drop the `.ota` into the path set by the `ota.image_block_response_delay` / `ota.custom_files` config (see z2m OTA docs).
-2. Trigger an OTA check from the z2m UI.
+## Repo layout
 
-### Rollback
+```
+main/
+├── CMakeLists.txt
+├── idf_component.yml    # k0i05/esp_as7341 + espressif/esp-zigbee-lib
+└── main.c               # entire firmware, ~450 LOC
+partitions.csv           # otadata + ota_0 + ota_1 + zb_storage + zb_fct
+sdkconfig.defaults       # target, OTA, rollback, 4 MB flash
+zha_quirk/
+└── acamilo_lightmeter.py   # HA ZHA quirk — drop into HA's custom_zha_quirks/
+scripts/
+└── make_ota.py          # package .bin into ZCL OTA Upgrade File
+CMakeLists.txt           # top-level IDF project
+README.md                # this file
+```
 
-If the new image fails to rejoin the network within a reasonable time, the bootloader reverts to the previous image on the next reset (`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`). A bricked update un-bricks itself on next power cycle. Once the new firmware rejoins successfully, it calls `esp_ota_mark_app_valid_cancel_rollback()` and becomes the permanent image.
+## License
 
-### First-time flash
-
-The factory-flashed image must come via USB — partition layout changed from single `factory` to dual OTA slots. After that, OTA handles everything.
-
-## Calibration TODO
-
-Per-band responsivity coefficients (`responsivity_basic[]` in `main/main.c`) are AS7341 datasheet-typical values normalized into the k0i05 basic-counts domain — expect accuracy within a factor of ~2. For anything better, single-point-calibrate each band against a reference meter (Apogee MQ-500 / LI-COR LI-250 / similar) under a known PAR source, then scale each `responsivity_basic[i]` by `(firmware_umol / reference_umol)`.
-
-The photopic lux channel (EP 10) uses CIE 1931 V(λ) weights sampled at the AS7341 band centers, with each band treated as a delta at its center wavelength — approximate, but sufficient for cross-checking PPFD channels against an ordinary lux meter.
+MIT.
