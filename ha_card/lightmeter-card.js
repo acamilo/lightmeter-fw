@@ -16,15 +16,22 @@
  *   title:        "Lightmeter"                           (default)
  */
 (() => {
+  // Nine bands in the spectrum bar chart: the eight visible F1..F8 channels
+  // plus the AS7341's ~910 nm NIR channel. Bar colors approximate sRGB for
+  // the visible bands; NIR gets a dark maroon since it's beyond human
+  // vision. The NIR bar follows F8 visually with no gap — bars are evenly
+  // spaced rather than proportional to wavelength, which keeps the chart
+  // compact on narrow HA dashboards.
   const BANDS = [
-    { key: "f1_415nm_ppfd", nm: 415, color: "#7a00ff" },
-    { key: "f2_445nm_ppfd", nm: 445, color: "#0033ff" },
-    { key: "f3_480nm_ppfd", nm: 480, color: "#00bfff" },
-    { key: "f4_515nm_ppfd", nm: 515, color: "#00d08c" },
-    { key: "f5_555nm_ppfd", nm: 555, color: "#a4d000" },
-    { key: "f6_590nm_ppfd", nm: 590, color: "#ffb300" },
-    { key: "f7_630nm_ppfd", nm: 630, color: "#ff5a00" },
-    { key: "f8_680nm_ppfd", nm: 680, color: "#c40000" },
+    { key: "f1_415nm_ppfd", nm: 415, color: "#7a00ff", label: "415" },
+    { key: "f2_445nm_ppfd", nm: 445, color: "#0033ff", label: "445" },
+    { key: "f3_480nm_ppfd", nm: 480, color: "#00bfff", label: "480" },
+    { key: "f4_515nm_ppfd", nm: 515, color: "#00d08c", label: "515" },
+    { key: "f5_555nm_ppfd", nm: 555, color: "#a4d000", label: "555" },
+    { key: "f6_590nm_ppfd", nm: 590, color: "#ffb300", label: "590" },
+    { key: "f7_630nm_ppfd", nm: 630, color: "#ff5a00", label: "630" },
+    { key: "f8_680nm_ppfd", nm: 680, color: "#c40000", label: "680" },
+    { key: "nir_910nm_pfd", nm: 910, color: "#4a0404", label: "910" },
   ];
 
   class LightmeterCard extends HTMLElement {
@@ -66,7 +73,6 @@
       const values = BANDS.map((b) => this._num(`${E}_${b.key}`));
       const par   = this._num(`${E}_par_total`);
       const lux   = this._num(`${E}_illuminance`);
-      const nir   = this._num(`${E}_nir_910nm_pfd`);
       const flicker   = this._onOff(`${B}_flicker_detected`)    === "on";
       const saturated = this._onOff(`${B}_spectral_saturated`)  === "on";
 
@@ -87,7 +93,7 @@
           bars += `<rect x="${x}" y="${H - 6}" width="${BW}" height="4" fill="var(--disabled-text-color)" rx="2" opacity="0.4"/>`;
           labels += `<text x="${x + BW / 2}" y="${H - 12}" class="val muted">—</text>`;
         }
-        ticks += `<text x="${x + BW / 2}" y="${H + 16}" class="tick">${b.nm}</text>`;
+        ticks += `<text x="${x + BW / 2}" y="${H + 16}" class="tick">${b.label}</text>`;
       });
 
       const warn = (on, label) => `
@@ -138,10 +144,9 @@
                 ${labels}
                 ${ticks}
               </svg>
-              <div class="axis">wavelength (nm)</div>
             </div>
             <div class="footer">
-              <div>NIR 910 nm: ${this._fmt(nir, 2)} µmol/m²/s</div>
+              <div>wavelength (nm) — last bar is NIR outside the PAR band</div>
               <div class="footer-chips">
                 ${warn(flicker,   "flicker")}
                 ${warn(saturated, "saturated")}
