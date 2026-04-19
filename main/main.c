@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <inttypes.h>
+#include <stdbool.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -80,78 +81,76 @@ static esp_err_t sensor_bringup(void) {
     return as7341_init(g_bus, &dev_cfg, &g_sensor);
 }
 
-// --- Channel table & photometric math ---------------------------------------
+// --- Channel table -----------------------------------------------------------
 
-#define NUM_CHANNELS 10
-#define ENDPOINT_BASE 1   // EP IDs run 1..NUM_CHANNELS
+#define NUM_CHANNELS   13
+#define ENDPOINT_BASE  1   // EP IDs run 1..NUM_CHANNELS
 
 typedef enum {
-    CH_MODE_BAND_PPFD,   // PPFD contribution of a single F1..F8 band
-    CH_MODE_PAR_TOTAL,   // sum of F1..F8 PPFD
-    CH_MODE_LUX,         // photopic-weighted illuminance
+    CH_TYPE_ANALOG,    // Analog Input cluster, float PresentValue
+    CH_TYPE_BINARY,    // Binary Input cluster, bool PresentValue
+} channel_type_t;
+
+typedef enum {
+    CH_MODE_BAND_PPFD,     // per-band PPFD from F1..F8 (visible PAR)
+    CH_MODE_NIR_PPFD,      // same formula applied to the NIR channel
+    CH_MODE_PAR_TOTAL,     // sum of F1..F8 PPFD
+    CH_MODE_LUX,           // photopic-weighted illuminance
+    CH_MODE_FLICKER,       // 100 Hz / 120 Hz mains flicker detected
+    CH_MODE_SATURATED,     // any spectral channel saturated last read
 } channel_mode_t;
 
 typedef struct {
-    uint16_t       wavelength_nm;   // 0 for aggregate channels
-    const char    *description;     // shown in ZCL Description attr
+    channel_type_t type;
     channel_mode_t mode;
+    uint16_t       wavelength_nm;   // 0 if not applicable
+    int            band_idx;        // 0..7 for F1..F8, -1 otherwise
+    const char    *description;
 } channel_spec_t;
 
-// Ordered by endpoint ID (EP 1 = index 0).
 static const channel_spec_t channels[NUM_CHANNELS] = {
-    { 415, "F1 415nm PPFD umol/m2/s", CH_MODE_BAND_PPFD },
-    { 445, "F2 445nm PPFD umol/m2/s", CH_MODE_BAND_PPFD },
-    { 480, "F3 480nm PPFD umol/m2/s", CH_MODE_BAND_PPFD },
-    { 515, "F4 515nm PPFD umol/m2/s", CH_MODE_BAND_PPFD },
-    { 555, "F5 555nm PPFD umol/m2/s", CH_MODE_BAND_PPFD },
-    { 590, "F6 590nm PPFD umol/m2/s", CH_MODE_BAND_PPFD },
-    { 630, "F7 630nm PPFD umol/m2/s", CH_MODE_BAND_PPFD },
-    { 680, "F8 680nm PPFD umol/m2/s", CH_MODE_BAND_PPFD },
-    {   0, "PAR total PPFD umol/m2/s", CH_MODE_PAR_TOTAL },
-    {   0, "Illuminance lux photopic", CH_MODE_LUX },
+    { CH_TYPE_ANALOG, CH_MODE_BAND_PPFD, 415, 0, "F1 415nm PPFD umol/m2/s" },
+    { CH_TYPE_ANALOG, CH_MODE_BAND_PPFD, 445, 1, "F2 445nm PPFD umol/m2/s" },
+    { CH_TYPE_ANALOG, CH_MODE_BAND_PPFD, 480, 2, "F3 480nm PPFD umol/m2/s" },
+    { CH_TYPE_ANALOG, CH_MODE_BAND_PPFD, 515, 3, "F4 515nm PPFD umol/m2/s" },
+    { CH_TYPE_ANALOG, CH_MODE_BAND_PPFD, 555, 4, "F5 555nm PPFD umol/m2/s" },
+    { CH_TYPE_ANALOG, CH_MODE_BAND_PPFD, 590, 5, "F6 590nm PPFD umol/m2/s" },
+    { CH_TYPE_ANALOG, CH_MODE_BAND_PPFD, 630, 6, "F7 630nm PPFD umol/m2/s" },
+    { CH_TYPE_ANALOG, CH_MODE_BAND_PPFD, 680, 7, "F8 680nm PPFD umol/m2/s" },
+    { CH_TYPE_ANALOG, CH_MODE_PAR_TOTAL,   0, -1, "PAR total PPFD umol/m2/s" },
+    { CH_TYPE_ANALOG, CH_MODE_LUX,         0, -1, "Illuminance lux photopic" },
+    { CH_TYPE_ANALOG, CH_MODE_NIR_PPFD,   910, -1, "NIR 910nm PFD umol/m2/s" },
+    { CH_TYPE_BINARY, CH_MODE_FLICKER,     0, -1, "Flicker 100/120Hz detected" },
+    { CH_TYPE_BINARY, CH_MODE_SATURATED,   0, -1, "Spectral channel saturated" },
 };
 
-// AS7341 datasheet-typical responsivity in counts per (uW/cm^2), measured at
-// 128x gain / 50ms integration and re-normalized into the "basic counts"
-// domain used by the k0i05 driver. TODO: calibrate each band against a
-// reference meter; the shipped numbers are within a factor of ~2 at best.
-static const float responsivity_basic[8] = {
-    1.016f,  // F1 415nm
-    1.078f,  // F2 445nm
-    1.150f,  // F3 480nm
-    1.094f,  // F4 515nm
-    1.011f,  // F5 555nm
-    1.038f,  // F6 590nm
-    1.167f,  // F7 630nm
-    1.166f,  // F8 680nm
+// Per-band responsivity in the k0i05 "basic counts" domain (counts / (µW/cm²)).
+// Datasheet-typical values for F1..F8 + a plausible NIR figure. Expect factor
+// of ~2 accuracy until single-point calibrated against a reference meter.
+static const float responsivity_basic_f1_f8[8] = {
+    1.016f, 1.078f, 1.150f, 1.094f, 1.011f, 1.038f, 1.167f, 1.166f,
 };
+static const float responsivity_basic_nir = 1.10f;
 
-// CIE 1931 photopic luminosity function V(lambda) sampled at our band centers.
+// CIE 1931 photopic V(λ) at the AS7341 band centers.
 static const float photopic_weight[8] = {
     0.00158f, 0.0355f, 0.139f, 0.608f,
     1.000f,   0.757f,  0.265f, 0.0170f,
 };
 
-// Converts AS7341 "basic counts" on a band to PPFD (umol/m^2/s).
-//   basic_counts / responsivity  =>  irradiance in uW/cm^2
-//   uW/cm^2 * 0.01               =>  W/m^2
-//   W/m^2  * lambda_nm / 119.6   =>  umol/m^2/s   (planck-relation per-band)
-static float band_to_ppfd(float basic_counts, int band_idx) {
-    float irradiance_uw_per_cm2 = basic_counts / responsivity_basic[band_idx];
-    float irradiance_w_per_m2   = irradiance_uw_per_cm2 * 0.01f;
-    return irradiance_w_per_m2 * (float)channels[band_idx].wavelength_nm / 119.6f;
+// --- Photometric math --------------------------------------------------------
+
+static float ppfd_from_basic(float basic, float responsivity, uint16_t lambda_nm) {
+    float irradiance_uW_cm2 = basic / responsivity;
+    float irradiance_W_m2   = irradiance_uW_cm2 * 0.01f;
+    return irradiance_W_m2 * (float)lambda_nm / 119.6f;
 }
 
-// Photopic-weighted lux estimate from F1..F8.
-//   lux = 683 * sum_i( V(lambda_i) * irradiance_i(W/m^2) )
-// Approximation: treats each AS7341 band as a delta at its center wavelength.
-// Real lux would integrate over the band shapes — fine for horticulture-grade
-// cross-checking against the PPFD channels, not for photometry certification.
-static float compute_lux(const float basic[8]) {
+static float compute_lux(const float basic_f1_f8[8]) {
     float sum = 0.0f;
     for (int i = 0; i < 8; i++) {
-        float irr_w_m2 = (basic[i] / responsivity_basic[i]) * 0.01f;
-        sum += photopic_weight[i] * irr_w_m2;
+        float irr_W_m2 = (basic_f1_f8[i] / responsivity_basic_f1_f8[i]) * 0.01f;
+        sum += photopic_weight[i] * irr_W_m2;
     }
     return 683.0f * sum;
 }
@@ -159,12 +158,7 @@ static float compute_lux(const float basic[8]) {
 // --- Zigbee plumbing ---------------------------------------------------------
 
 #define ESP_ZB_PRIMARY_CHANNEL_MASK ESP_ZB_TRANSCEIVER_ALL_CHANNELS_MASK
-
-// BACnet engineering-units enum value for "no_units" / generic. Zigbee's
-// fixed enum has no PPFD or lux-as-first-class; ZHA users typically
-// override the display unit on the HA entity anyway. The Description
-// attribute carries the real unit string.
-#define ENG_UNITS_NO_UNITS 95
+#define ENG_UNITS_NO_UNITS          95  // BACnet "no_units" — closest to µmol/m²/s
 
 static void start_network_steering(uint8_t param) {
     (void)param;
@@ -188,7 +182,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
                 ESP_LOGI(TAG, "Joining a Zigbee network (factory new, starting steering)");
                 esp_zb_bdb_start_top_level_commissioning(ESP_ZB_BDB_MODE_NETWORK_STEERING);
             } else {
-                ESP_LOGI(TAG, "Rejoined existing network: PAN=0x%04x ch=%d short=0x%04x",
+                ESP_LOGI(TAG, "Rejoined network: PAN=0x%04x ch=%d short=0x%04x",
                          esp_zb_get_pan_id(), esp_zb_get_current_channel(),
                          esp_zb_get_short_address());
             }
@@ -216,42 +210,44 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
     }
 }
 
-// Build one endpoint: Basic + Identify + Analog Input (with Description +
-// EngineeringUnits). Each endpoint is presented as a "Simple Sensor" device.
-static void add_analog_endpoint(esp_zb_ep_list_t *ep_list, uint8_t ep_id,
-                                const char *description_str) {
-    esp_zb_cluster_list_t *cluster_list = esp_zb_zcl_cluster_list_create();
-
+// Add Basic + Identify to a cluster list. All our endpoints want both.
+static void add_basic_and_identify(esp_zb_cluster_list_t *cluster_list) {
     esp_zb_basic_cluster_cfg_t basic_cfg = {
         .zcl_version  = ESP_ZB_ZCL_BASIC_ZCL_VERSION_DEFAULT_VALUE,
         .power_source = ESP_ZB_ZCL_BASIC_POWER_SOURCE_DEFAULT_VALUE,
     };
     esp_zb_cluster_list_add_basic_cluster(
-        cluster_list,
-        esp_zb_basic_cluster_create(&basic_cfg),
+        cluster_list, esp_zb_basic_cluster_create(&basic_cfg),
         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
     esp_zb_identify_cluster_cfg_t identify_cfg = {
         .identify_time = ESP_ZB_ZCL_IDENTIFY_IDENTIFY_TIME_DEFAULT_VALUE,
     };
     esp_zb_cluster_list_add_identify_cluster(
-        cluster_list,
-        esp_zb_identify_cluster_create(&identify_cfg),
+        cluster_list, esp_zb_identify_cluster_create(&identify_cfg),
         ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+}
+
+// Pack a plain C string into the ZCL character_string format (length-prefix).
+static void pack_zcl_string(const char *in, uint8_t *out, size_t out_capacity) {
+    size_t n = strlen(in);
+    if (n > out_capacity - 1) n = out_capacity - 1;
+    out[0] = (uint8_t)n;
+    memcpy(&out[1], in, n);
+}
+
+static void add_analog_endpoint(esp_zb_ep_list_t *ep_list, uint8_t ep_id,
+                                const char *description_str) {
+    esp_zb_cluster_list_t *cluster_list = esp_zb_zcl_cluster_list_create();
+    add_basic_and_identify(cluster_list);
 
     esp_zb_analog_input_cluster_cfg_t ai_cfg = {
-        .out_of_service = false,
-        .present_value  = 0.0f,
-        .status_flags   = 0,
+        .out_of_service = false, .present_value = 0.0f, .status_flags = 0,
     };
     esp_zb_attribute_list_t *ai_attrs = esp_zb_analog_input_cluster_create(&ai_cfg);
 
-    // Description attribute is a ZCL character_string: [length byte][bytes...].
-    size_t desc_len = strlen(description_str);
-    if (desc_len > 32) desc_len = 32;  // Description attr spec caps at 32 chars
     uint8_t desc_buf[33];
-    desc_buf[0] = (uint8_t)desc_len;
-    memcpy(&desc_buf[1], description_str, desc_len);
+    pack_zcl_string(description_str, desc_buf, sizeof(desc_buf));
     esp_zb_analog_input_cluster_add_attr(
         ai_attrs, ESP_ZB_ZCL_ATTR_ANALOG_INPUT_DESCRIPTION_ID, desc_buf);
 
@@ -263,37 +259,69 @@ static void add_analog_endpoint(esp_zb_ep_list_t *ep_list, uint8_t ep_id,
         cluster_list, ai_attrs, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
 
     esp_zb_endpoint_config_t ep_cfg = {
-        .endpoint           = ep_id,
-        .app_profile_id     = ESP_ZB_AF_HA_PROFILE_ID,
-        .app_device_id      = ESP_ZB_HA_SIMPLE_SENSOR_DEVICE_ID,
+        .endpoint = ep_id,
+        .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        .app_device_id = ESP_ZB_HA_SIMPLE_SENSOR_DEVICE_ID,
         .app_device_version = 0,
     };
     esp_zb_ep_list_add_ep(ep_list, cluster_list, ep_cfg);
 }
 
-// Configure attribute reporting so the coordinator (ZHA) gets pushed updates
-// instead of having to poll. Per ZCL: report no faster than min_interval, no
-// slower than max_interval, and always if PresentValue drifts by >= delta.
-//   min_interval  = 2 s   (matches sensor_task cadence)
-//   max_interval  = 60 s  (heartbeat so HA knows we're alive)
-//   delta         = 0.1   (0.1 µmol/m²/s for PPFD bands; 0.1 lux for EP 10)
-// Re-reporting is cheap and the radio duty cycle is already tiny.
+static void add_binary_endpoint(esp_zb_ep_list_t *ep_list, uint8_t ep_id,
+                                const char *description_str) {
+    esp_zb_cluster_list_t *cluster_list = esp_zb_zcl_cluster_list_create();
+    add_basic_and_identify(cluster_list);
+
+    esp_zb_binary_input_cluster_cfg_t bi_cfg = {
+        .out_of_service = false, .present_value = false, .status_flags = 0,
+    };
+    esp_zb_attribute_list_t *bi_attrs = esp_zb_binary_input_cluster_create(&bi_cfg);
+
+    uint8_t desc_buf[33];
+    pack_zcl_string(description_str, desc_buf, sizeof(desc_buf));
+    esp_zb_cluster_add_attr(
+        bi_attrs, ESP_ZB_ZCL_CLUSTER_ID_BINARY_INPUT,
+        ESP_ZB_ZCL_ATTR_BINARY_INPUT_DESCRIPTION_ID,
+        ESP_ZB_ZCL_ATTR_TYPE_CHAR_STRING,
+        ESP_ZB_ZCL_ATTR_ACCESS_READ_ONLY, desc_buf);
+
+    esp_zb_cluster_list_add_binary_input_cluster(
+        cluster_list, bi_attrs, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE);
+
+    esp_zb_endpoint_config_t ep_cfg = {
+        .endpoint = ep_id,
+        .app_profile_id = ESP_ZB_AF_HA_PROFILE_ID,
+        .app_device_id = ESP_ZB_HA_SIMPLE_SENSOR_DEVICE_ID,
+        .app_device_version = 0,
+    };
+    esp_zb_ep_list_add_ep(ep_list, cluster_list, ep_cfg);
+}
+
+// See the long comment on the previous revision: coordinators usually override
+// these with their own ConfigureReport bindings, but they're good fallbacks
+// and get used by stacks that don't bind aggressively (z2m sometimes).
 static void configure_reporting(void) {
     for (int i = 0; i < NUM_CHANNELS; i++) {
         esp_zb_zcl_reporting_info_t info = {
             .direction    = ESP_ZB_ZCL_REPORT_DIRECTION_SEND,
             .ep           = (uint8_t)(ENDPOINT_BASE + i),
-            .cluster_id   = ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
             .cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-            .attr_id      = ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID,
+            .attr_id      = 0x0055,   // PresentValue is 0x0055 on both AI and BI
             .flags        = 0,
             .run_time     = 0,
         };
+        info.cluster_id = (channels[i].type == CH_TYPE_ANALOG)
+            ? ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT
+            : ESP_ZB_ZCL_CLUSTER_ID_BINARY_INPUT;
         info.u.send_info.min_interval     = 2;
         info.u.send_info.max_interval     = 60;
         info.u.send_info.def_min_interval = 2;
         info.u.send_info.def_max_interval = 60;
-        info.u.send_info.delta.f32        = 0.1f;
+        if (channels[i].type == CH_TYPE_ANALOG) {
+            info.u.send_info.delta.f32 = 0.1f;
+        } else {
+            info.u.send_info.delta.u8 = 1;   // any bool transition counts
+        }
         esp_zb_zcl_update_reporting_info(&info);
     }
 }
@@ -311,7 +339,12 @@ static void esp_zb_task(void *pvParameters) {
 
     esp_zb_ep_list_t *ep_list = esp_zb_ep_list_create();
     for (int i = 0; i < NUM_CHANNELS; i++) {
-        add_analog_endpoint(ep_list, (uint8_t)(ENDPOINT_BASE + i), channels[i].description);
+        uint8_t ep_id = (uint8_t)(ENDPOINT_BASE + i);
+        if (channels[i].type == CH_TYPE_ANALOG) {
+            add_analog_endpoint(ep_list, ep_id, channels[i].description);
+        } else {
+            add_binary_endpoint(ep_list, ep_id, channels[i].description);
+        }
     }
     esp_zb_device_register(ep_list);
     configure_reporting();
@@ -323,60 +356,86 @@ static void esp_zb_task(void *pvParameters) {
 
 // --- Sensor loop --------------------------------------------------------------
 
-static void push_present_value(uint8_t ep_id, float value) {
+static void push_analog(uint8_t ep_id, float value) {
     esp_zb_lock_acquire(portMAX_DELAY);
     esp_zb_zcl_set_attribute_val(
-        ep_id,
-        ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
-        ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
-        ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID,
-        &value,
-        false);
+        ep_id, ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+        ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID, &value, false);
+    esp_zb_lock_release();
+}
+
+static void push_binary(uint8_t ep_id, bool value) {
+    esp_zb_lock_acquire(portMAX_DELAY);
+    esp_zb_zcl_set_attribute_val(
+        ep_id, ESP_ZB_ZCL_CLUSTER_ID_BINARY_INPUT, ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+        ESP_ZB_ZCL_ATTR_BINARY_INPUT_PRESENT_VALUE_ID, &value, false);
     esp_zb_lock_release();
 }
 
 static void sensor_task(void *pvParameters) {
     printf("ts_ms,");
-    for (int i = 0; i < NUM_CHANNELS; i++) printf("%s%s", channels[i].description, i == NUM_CHANNELS - 1 ? "\n" : ",");
+    for (int i = 0; i < NUM_CHANNELS; i++) {
+        printf("%s%s", channels[i].description, i == NUM_CHANNELS - 1 ? "\n" : ",");
+    }
 
     while (1) {
         as7341_channels_spectral_data_t raw;
-        esp_err_t r = as7341_get_spectral_measurements(g_sensor, &raw);
-        if (r != ESP_OK) {
-            ESP_LOGW(TAG, "AS7341 read failed: %s", esp_err_to_name(r));
+        if (as7341_get_spectral_measurements(g_sensor, &raw) != ESP_OK) {
             vTaskDelay(pdMS_TO_TICKS(READ_INTERVAL_MS));
             continue;
         }
-
         as7341_channels_basic_counts_data_t basic;
-        r = as7341_get_basic_counts(g_sensor, raw, &basic);
-        if (r != ESP_OK) {
-            ESP_LOGW(TAG, "basic_counts conversion failed: %s", esp_err_to_name(r));
+        if (as7341_get_basic_counts(g_sensor, raw, &basic) != ESP_OK) {
             vTaskDelay(pdMS_TO_TICKS(READ_INTERVAL_MS));
             continue;
         }
 
-        float basic_by_band[8] = {
+        float basic_f1_f8[8] = {
             basic.f1, basic.f2, basic.f3, basic.f4,
             basic.f5, basic.f6, basic.f7, basic.f8,
         };
 
+        // Flicker detection status — only treat the explicit 100/120 Hz
+        // verdicts as "yes"; UNKNOWN/INVALID mean the engine hasn't latched
+        // onto a frequency yet, not that flicker is absent.
+        as7341_flicker_detection_states_t flicker_state = AS7341_FLICKER_DETECTION_INVALID;
+        (void)as7341_get_flicker_detection_status(g_sensor, &flicker_state);
+        bool flicker_detected = (flicker_state == AS7341_FLICKER_DETECTION_100HZ) ||
+                                (flicker_state == AS7341_FLICKER_DETECTION_120HZ);
+
+        // Saturation — any kind of rail-out on the spectral or flicker path.
+        as7341_status2_register_t st2 = { .reg = 0 };
+        (void)as7341_get_status2_register(g_sensor, &st2);
+        bool saturated = st2.bits.digital_saturation ||
+                         st2.bits.analog_saturation ||
+                         st2.bits.flicker_detect_digital_saturation ||
+                         st2.bits.flicker_detect_analog_saturation;
+
+        // Analog values by channel.
         float values[NUM_CHANNELS];
         float par_total = 0.0f;
         for (int i = 0; i < 8; i++) {
-            values[i] = band_to_ppfd(basic_by_band[i], i);
-            par_total += values[i];
+            float v = ppfd_from_basic(basic_f1_f8[i], responsivity_basic_f1_f8[i],
+                                      channels[i].wavelength_nm);
+            values[i] = v;
+            par_total += v;
         }
-        values[8] = par_total;
-        values[9] = compute_lux(basic_by_band);
+        values[8]  = par_total;
+        values[9]  = compute_lux(basic_f1_f8);
+        values[10] = ppfd_from_basic(basic.nir, responsivity_basic_nir,
+                                     channels[10].wavelength_nm);
 
+        // CSV debug line
         printf("%" PRId64, esp_timer_get_time() / 1000);
-        for (int i = 0; i < NUM_CHANNELS; i++) printf(",%.3f", values[i]);
-        printf("\n");
+        for (int i = 0; i < 11; i++) printf(",%.3f", values[i]);
+        printf(",%d,%d\n", flicker_detected, saturated);
 
-        for (int i = 0; i < NUM_CHANNELS; i++) {
-            push_present_value((uint8_t)(ENDPOINT_BASE + i), values[i]);
+        // Push to Zigbee
+        for (int i = 0; i < 11; i++) {
+            push_analog((uint8_t)(ENDPOINT_BASE + i), values[i]);
         }
+        push_binary((uint8_t)(ENDPOINT_BASE + 11), flicker_detected);
+        push_binary((uint8_t)(ENDPOINT_BASE + 12), saturated);
 
         vTaskDelay(pdMS_TO_TICKS(READ_INTERVAL_MS));
     }
@@ -385,7 +444,7 @@ static void sensor_task(void *pvParameters) {
 // --- Boot --------------------------------------------------------------------
 
 void app_main(void) {
-    ESP_LOGI(TAG, "lightmeter boot — %d-endpoint Analog Input, ZHA-compatible", NUM_CHANNELS);
+    ESP_LOGI(TAG, "lightmeter boot — %d endpoints (10 analog + 2 binary + NIR)", NUM_CHANNELS);
 
     ESP_ERROR_CHECK(nvs_flash_init());
 

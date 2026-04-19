@@ -1,6 +1,6 @@
 # lightmeter
 
-10-channel spectral light meter firmware for the Adafruit AS7341 (PID 4698) driven by an ESP32-H2-DevKitM-1 (PID 5715) over STEMMA QT / I²C. The H2 acts as a Zigbee end-device with **10 endpoints**, each exposing one Analog Input cluster so Home Assistant's ZHA integration auto-discovers them as ten separate sensor entities — F1..F8 per-band PPFD, PAR total, and photopic lux.
+10-channel spectral light meter firmware for the Adafruit AS7341 (PID 4698) driven by an ESP32-H2-DevKitM-1 (PID 5715) over STEMMA QT / I²C. The H2 acts as a Zigbee end-device with **13 endpoints** — 11 Analog Input (F1..F8 per-band PPFD, PAR total, photopic lux, NIR) and 2 Binary Input (mains flicker detected, spectral saturation). ZHA auto-discovers each endpoint as its own sensor / binary_sensor entity.
 
 ## Build
 
@@ -29,26 +29,33 @@ On boot the firmware scans a list of candidate I²C pin pairs (`{12,22}`, `{4,5}
 
 ## Endpoints exposed to ZHA
 
-| Endpoint | Description (ZCL attr 0x001C) | Unit |
-|---:|---|---|
-| 1 | `F1 415nm PPFD umol/m2/s` | µmol/m²/s |
-| 2 | `F2 445nm PPFD umol/m2/s` | µmol/m²/s |
-| 3 | `F3 480nm PPFD umol/m2/s` | µmol/m²/s |
-| 4 | `F4 515nm PPFD umol/m2/s` | µmol/m²/s |
-| 5 | `F5 555nm PPFD umol/m2/s` | µmol/m²/s |
-| 6 | `F6 590nm PPFD umol/m2/s` | µmol/m²/s |
-| 7 | `F7 630nm PPFD umol/m2/s` | µmol/m²/s |
-| 8 | `F8 680nm PPFD umol/m2/s` | µmol/m²/s |
-| 9 | `PAR total PPFD umol/m2/s` | µmol/m²/s (sum of F1..F8) |
-| 10 | `Illuminance lux photopic` | lux |
+| Endpoint | Cluster | Description (ZCL attr 0x001C) | Unit |
+|---:|---|---|---|
+| 1 | Analog Input | `F1 415nm PPFD umol/m2/s` | µmol/m²/s |
+| 2 | Analog Input | `F2 445nm PPFD umol/m2/s` | µmol/m²/s |
+| 3 | Analog Input | `F3 480nm PPFD umol/m2/s` | µmol/m²/s |
+| 4 | Analog Input | `F4 515nm PPFD umol/m2/s` | µmol/m²/s |
+| 5 | Analog Input | `F5 555nm PPFD umol/m2/s` | µmol/m²/s |
+| 6 | Analog Input | `F6 590nm PPFD umol/m2/s` | µmol/m²/s |
+| 7 | Analog Input | `F7 630nm PPFD umol/m2/s` | µmol/m²/s |
+| 8 | Analog Input | `F8 680nm PPFD umol/m2/s` | µmol/m²/s |
+| 9 | Analog Input | `PAR total PPFD umol/m2/s` | µmol/m²/s (sum of F1..F8) |
+| 10 | Analog Input | `Illuminance lux photopic` | lux |
+| 11 | Analog Input | `NIR 910nm PFD umol/m2/s` | µmol/m²/s |
+| 12 | **Binary Input** | `Flicker 100/120Hz detected` | bool |
+| 13 | **Binary Input** | `Spectral channel saturated` | bool |
 
-Each endpoint is advertised as an HA Simple Sensor (device ID 0x000C) with Basic + Identify + Analog Input (0x000C) clusters. ZHA's `EngineeringUnits` slot is set to `no_units` (95) since ZCL's unit enum has no entry for µmol/m²/s or lux; the Description attribute carries the human-readable unit string. To pretty up the unit label on the HA entity, either (a) customize the unit per-entity in HA, or (b) ship a `zha-device-handlers` quirk that overrides display units.
+Every endpoint is advertised as an HA Simple Sensor (device ID 0x000C) with Basic + Identify + either Analog Input (0x000C) or Binary Input (0x000F). ZHA's `EngineeringUnits` slot on the analog endpoints is set to `no_units` (95) since ZCL's unit enum has no entry for µmol/m²/s or lux; the Description attribute carries the real unit string. To pretty up the unit label on the HA entity, either (a) customize the unit per-entity in HA, or (b) ship a `zha-device-handlers` quirk that overrides display units.
+
+**Flicker (EP 12)** goes `true` only when the AS7341's flicker engine locks onto 100 Hz or 120 Hz (mains-frequency light driver artifacts). `UNKNOWN` / `INVALID` states stay `false` — they mean "not locked yet," not "no flicker." Useful for grow-light QA.
+
+**Saturation (EP 13)** goes `true` if any of the spectral or flicker-detect channels saturate (analog or digital) on the most recent read — i.e., your spectral data is capped and therefore lies about the real light level. Treat any non-zero reading as a hint to drop gain or shorten integration.
 
 ## Pairing to Home Assistant (ZHA)
 
 1. In Home Assistant: **Settings → Devices → ZHA → Add device**.
 2. Power-cycle or reset the lightmeter. It boots factory-new, scans all 802.15.4 channels, and joins automatically. No install code needed.
-3. Ten `sensor.*` entities appear under one device, one per endpoint, updated every 2 s.
+3. Eleven `sensor.*` entities plus two `binary_sensor.*` entities appear under one device, one per endpoint. All update every 2 s; the coordinator also gets a heartbeat every 60 s via configured attribute reporting.
 
 ## Output
 
