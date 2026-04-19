@@ -31,7 +31,7 @@
 // from future updates.
 #define LIGHTMETER_MANUFACTURER  0x1289
 #define LIGHTMETER_IMAGE_TYPE    0x0001
-#define LIGHTMETER_FW_VERSION    0x00000005   // bump for each release
+#define LIGHTMETER_FW_VERSION    0x00000006   // bump for each release
 
 // Shown in ZHA's "Manage Device" view and used by the matching quirk. These
 // are ZCL character strings so they get the usual length-byte prefix in RAM;
@@ -62,6 +62,33 @@ static const pin_pair_t candidate_pairs[] = {
 
 static i2c_master_bus_handle_t g_bus    = NULL;
 static as7341_handle_t         g_sensor = NULL;
+
+// AGC state — the current gain setting, updated between reads based on
+// saturation and max raw count. Starts at 1× and floats up or down to keep
+// the max spectral channel in a sweet-spot range.
+static as7341_spectral_gains_t g_gain = AS7341_SPECTRAL_GAIN_1X;
+static const as7341_spectral_gains_t AGC_MIN_GAIN = AS7341_SPECTRAL_GAIN_0_5X;
+static const as7341_spectral_gains_t AGC_MAX_GAIN = AS7341_SPECTRAL_GAIN_512X;
+// Thresholds chosen empirically against a typical grow light. The AS7341's
+// analog front-end saturates well before the digital ADC pegs — often around
+// raw count 2000-3000 at higher gains even though 65535 is the digital
+// ceiling. That makes a naive "if max_raw < LO, step up" flip-flop between
+// a stable non-saturated gain and the next-higher one that analog-saturates.
+// Two guardrails:
+//   - HI set at ~70% of digital range for headroom
+//   - LO deliberately low (1.5%) and gated by a post-step-down cooldown,
+//     so we don't immediately step back up after the analog front-end told
+//     us "that's too much."
+#define AGC_HI_COUNT          45000u
+#define AGC_LO_COUNT           1000u
+#define AGC_STEPDOWN_COOLDOWN     4  // cycles (~8 s at 2 s READ_INTERVAL_MS)
+
+static const char *gain_name(as7341_spectral_gains_t g) {
+    static const char *names[] = {
+        "0.5x","1x","2x","4x","8x","16x","32x","64x","128x","256x","512x",
+    };
+    return ((unsigned)g < sizeof(names) / sizeof(names[0])) ? names[g] : "?";
+}
 
 static esp_err_t make_bus(gpio_num_t sda, gpio_num_t scl, i2c_master_bus_handle_t *out) {
     i2c_master_bus_config_t cfg = {
@@ -98,11 +125,11 @@ static esp_err_t sensor_bringup(void) {
     ESP_LOGI(TAG, "AS7341 at 0x%02x on SDA=%d SCL=%d", AS7341_I2C_ADDR, sda, scl);
 
     as7341_config_t dev_cfg = I2C_AS7341_CONFIG_DEFAULT;
-    // Grow-light bright: 512x saturates the ADC at 0xFFFF. 32x + 100ms is
-    // a reasonable default for typical horticulture lighting. If the
-    // "spectral_saturated" binary sensor flips on, you're still too
-    // sensitive — drop to 16x/8x/etc.  TODO: wire up AS7341 AGC mode.
-    dev_cfg.spectral_gain = AS7341_SPECTRAL_GAIN_1X;
+    // Initial gain; software AGC adjusts from here each cycle based on
+    // saturation flags + max spectral count. Integration time is fixed
+    // (atime=20, astep=499 ≈ 28 ms per read) — the dynamic range comes
+    // entirely from gain stepping.
+    dev_cfg.spectral_gain = g_gain;
     dev_cfg.atime         = 20;
     dev_cfg.astep         = 499;
     return as7341_init(g_bus, &dev_cfg, &g_sensor);
@@ -612,10 +639,10 @@ static void sensor_task(void *pvParameters) {
         values[10] = ppfd_from_basic(basic.nir, responsivity_basic_nir,
                                      channels[10].wavelength_nm);
 
-        // CSV debug line
+        // CSV debug line with current gain for AGC observability
         printf("%" PRId64, esp_timer_get_time() / 1000);
         for (int i = 0; i < 11; i++) printf(",%.3f", values[i]);
-        printf(",%d,%d\n", flicker_detected, saturated);
+        printf(",%d,%d,%s\n", flicker_detected, saturated, gain_name(g_gain));
 
         // Push to Zigbee
         for (int i = 0; i < 11; i++) {
@@ -623,6 +650,37 @@ static void sensor_task(void *pvParameters) {
         }
         push_binary((uint8_t)(ENDPOINT_BASE + 11), flicker_detected);
         push_binary((uint8_t)(ENDPOINT_BASE + 12), saturated);
+
+        // AGC: adjust gain for next cycle based on this cycle's raw counts.
+        // Done AFTER basic_counts conversion so there's no race between
+        // "what gain was used for the current reading" and "what gain the
+        // driver reports to get_basic_counts".
+        uint16_t raw_max = 0;
+        const uint16_t *raw_f = (const uint16_t *)&raw;   // f1..f8 first
+        for (int i = 0; i < 8; i++) {
+            if (raw_f[i] > raw_max) raw_max = raw_f[i];
+        }
+        static int agc_cooldown = 0;  // count-down after each step-down
+        as7341_spectral_gains_t next_gain = g_gain;
+        if (saturated || raw_max > AGC_HI_COUNT) {
+            if (g_gain > AGC_MIN_GAIN) {
+                next_gain = (as7341_spectral_gains_t)(g_gain - 1);
+                agc_cooldown = AGC_STEPDOWN_COOLDOWN;
+            }
+        } else {
+            if (agc_cooldown > 0) {
+                agc_cooldown--;
+            } else if (raw_max < AGC_LO_COUNT && g_gain < AGC_MAX_GAIN) {
+                next_gain = (as7341_spectral_gains_t)(g_gain + 1);
+            }
+        }
+        if (next_gain != g_gain) {
+            if (as7341_set_spectral_gain(g_sensor, next_gain) == ESP_OK) {
+                ESP_LOGI(TAG, "AGC: %s -> %s (max_raw=%u saturated=%d)",
+                         gain_name(g_gain), gain_name(next_gain), raw_max, saturated);
+                g_gain = next_gain;
+            }
+        }
 
         vTaskDelay(pdMS_TO_TICKS(READ_INTERVAL_MS));
     }
