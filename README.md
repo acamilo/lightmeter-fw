@@ -188,7 +188,7 @@ The device advertises the ZCL OTA Upgrade cluster (0x0019) on endpoint 1 with du
 |---|---|
 | Manufacturer code | `0x1289` |
 | Image type | `0x0001` |
-| Current file version | `0x00000002` |
+| Current file version | `0x00000007` |
 
 Bump `LIGHTMETER_FW_VERSION` in `main/main.c` with every release.
 
@@ -196,12 +196,34 @@ Bump `LIGHTMETER_FW_VERSION` in `main/main.c` with every release.
 
 ```
 idf.py build
-scripts/make_ota.py build/lightmeter.bin lightmeter-v3.ota \
-    --manufacturer 0x1289 --image-type 0x0001 --version 0x00000003
-# drop the .ota into <HA config>/zigbee_ota/ and reload ZHA
+scripts/make_ota.py build/lightmeter.bin lightmeter-v8.ota \
+    --manufacturer 0x1289 --image-type 0x0001 --version 0x00000008
 ```
 
 `make_ota.py` wraps an ESP-IDF `.bin` in the ZCL OTA Upgrade File format (header + single Upgrade Image sub-element). Expect 15–30 min per update over Zigbee. If the new image fails to rejoin within the rollback window, the bootloader reverts on next reset.
+
+### Configuring ZHA to serve the image (one-time)
+
+ZHA needs an OTA provider pointed at your image directory. The right type is **`advanced`** (maps to zigpy's `AdvancedFileProvider` — recursively scans a directory for `.ota` files).
+
+Two gotchas cost me an hour figuring this out:
+
+1. **Not `zigpy_local`** — that type expects a JSON index file, not a directory of `.ota` binaries. Using it with a directory path silently does nothing.
+2. **`warning` field is required** — a verbatim safety-acknowledgment string. Omit it or mistype it and the provider silently fails to load. No log message.
+
+Via the ZHA integration UI: Settings → Devices & Services → ZHA → **Configure** → OTA providers → **+ Add** → pick `advanced`, path `/config/zigpy_ota`, tick the "I understand…" box.
+
+Or, via `.storage/core.config_entries` directly, merge this into the ZHA entry's `options`:
+
+```json
+"ota_providers": [{
+  "type": "advanced",
+  "path": "/config/zigpy_ota",
+  "warning": "I understand I can *destroy* my devices by enabling OTA updates from files. Some OTA updates can be mistakenly applied to the wrong device, breaking it. I am consciously using this at my own risk."
+}]
+```
+
+Restart HA. ZHA now scans `/config/zigpy_ota/` for `.ota` files on startup. Drop `lightmeter-v*.ota` into that directory — ZHA matches on the embedded manufacturer + image type, compares file_version, and offers the update via the `update.espressif_lightmeter_firmware` entity. Click **Install** on that entity (or call `update.install`) to trigger the transfer.
 
 ## Calibration
 
