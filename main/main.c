@@ -31,7 +31,7 @@
 // from future updates.
 #define LIGHTMETER_MANUFACTURER  0x1289
 #define LIGHTMETER_IMAGE_TYPE    0x0001
-#define LIGHTMETER_FW_VERSION    0x00000003   // bump for each release
+#define LIGHTMETER_FW_VERSION    0x00000005   // bump for each release
 
 // Shown in ZHA's "Manage Device" view and used by the matching quirk. These
 // are ZCL character strings so they get the usual length-byte prefix in RAM;
@@ -98,9 +98,13 @@ static esp_err_t sensor_bringup(void) {
     ESP_LOGI(TAG, "AS7341 at 0x%02x on SDA=%d SCL=%d", AS7341_I2C_ADDR, sda, scl);
 
     as7341_config_t dev_cfg = I2C_AS7341_CONFIG_DEFAULT;
-    dev_cfg.spectral_gain = AS7341_SPECTRAL_GAIN_512X;
-    dev_cfg.atime         = 100;
-    dev_cfg.astep         = 999;
+    // Grow-light bright: 512x saturates the ADC at 0xFFFF. 32x + 100ms is
+    // a reasonable default for typical horticulture lighting. If the
+    // "spectral_saturated" binary sensor flips on, you're still too
+    // sensitive — drop to 16x/8x/etc.  TODO: wire up AS7341 AGC mode.
+    dev_cfg.spectral_gain = AS7341_SPECTRAL_GAIN_1X;
+    dev_cfg.atime         = 20;
+    dev_cfg.astep         = 499;
     return as7341_init(g_bus, &dev_cfg, &g_sensor);
 }
 
@@ -148,12 +152,17 @@ static const channel_spec_t channels[NUM_CHANNELS] = {
 };
 
 // Per-band responsivity in the k0i05 "basic counts" domain (counts / (µW/cm²)).
-// Datasheet-typical values for F1..F8 + a plausible NIR figure. Expect factor
-// of ~2 accuracy until single-point calibrated against a reference meter.
+// The original datasheet-typical values were off by a uniform ~14× at 1× gain
+// / ~70 ms integration — cross-checked against an Apogee-class reference
+// reading 200 µmol/m²/s PAR under a grow light; the original firmware
+// reported 2864. Applied a single-point calibration factor of 14.32 to all
+// visible + NIR coefficients. Still preserve relative spectrum shape;
+// absolute accuracy beyond this single operating point needs per-band
+// reference readings.
 static const float responsivity_basic_f1_f8[8] = {
-    1.016f, 1.078f, 1.150f, 1.094f, 1.011f, 1.038f, 1.167f, 1.166f,
+    14.55f, 15.44f, 16.47f, 15.67f, 14.48f, 14.86f, 16.71f, 16.70f,
 };
-static const float responsivity_basic_nir = 1.10f;
+static const float responsivity_basic_nir = 15.75f;
 
 // CIE 1931 photopic V(λ) at the AS7341 band centers.
 static const float photopic_weight[8] = {
@@ -580,13 +589,14 @@ static void sensor_task(void *pvParameters) {
         bool flicker_detected = (flicker_state == AS7341_FLICKER_DETECTION_100HZ) ||
                                 (flicker_state == AS7341_FLICKER_DETECTION_120HZ);
 
-        // Saturation — any kind of rail-out on the spectral or flicker path.
+        // Saturation — only flag SPECTRAL path saturation. The flicker engine
+        // has its own saturation flags that can trip independently on bright
+        // light without the spectral channels saturating; mixing them makes
+        // the "is my PPFD reading trustworthy?" signal lie.
         as7341_status2_register_t st2 = { .reg = 0 };
         (void)as7341_get_status2_register(g_sensor, &st2);
         bool saturated = st2.bits.digital_saturation ||
-                         st2.bits.analog_saturation ||
-                         st2.bits.flicker_detect_digital_saturation ||
-                         st2.bits.flicker_detect_analog_saturation;
+                         st2.bits.analog_saturation;
 
         // Analog values by channel.
         float values[NUM_CHANNELS];
