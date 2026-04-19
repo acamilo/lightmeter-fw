@@ -271,6 +271,33 @@ static void add_analog_endpoint(esp_zb_ep_list_t *ep_list, uint8_t ep_id,
     esp_zb_ep_list_add_ep(ep_list, cluster_list, ep_cfg);
 }
 
+// Configure attribute reporting so the coordinator (ZHA) gets pushed updates
+// instead of having to poll. Per ZCL: report no faster than min_interval, no
+// slower than max_interval, and always if PresentValue drifts by >= delta.
+//   min_interval  = 2 s   (matches sensor_task cadence)
+//   max_interval  = 60 s  (heartbeat so HA knows we're alive)
+//   delta         = 0.1   (0.1 µmol/m²/s for PPFD bands; 0.1 lux for EP 10)
+// Re-reporting is cheap and the radio duty cycle is already tiny.
+static void configure_reporting(void) {
+    for (int i = 0; i < NUM_CHANNELS; i++) {
+        esp_zb_zcl_reporting_info_t info = {
+            .direction    = ESP_ZB_ZCL_REPORT_DIRECTION_SEND,
+            .ep           = (uint8_t)(ENDPOINT_BASE + i),
+            .cluster_id   = ESP_ZB_ZCL_CLUSTER_ID_ANALOG_INPUT,
+            .cluster_role = ESP_ZB_ZCL_CLUSTER_SERVER_ROLE,
+            .attr_id      = ESP_ZB_ZCL_ATTR_ANALOG_INPUT_PRESENT_VALUE_ID,
+            .flags        = 0,
+            .run_time     = 0,
+        };
+        info.u.send_info.min_interval     = 2;
+        info.u.send_info.max_interval     = 60;
+        info.u.send_info.def_min_interval = 2;
+        info.u.send_info.def_max_interval = 60;
+        info.u.send_info.delta.f32        = 0.1f;
+        esp_zb_zcl_update_reporting_info(&info);
+    }
+}
+
 static void esp_zb_task(void *pvParameters) {
     esp_zb_cfg_t zb_nwk_cfg = {
         .esp_zb_role         = ESP_ZB_DEVICE_TYPE_ED,
@@ -287,6 +314,7 @@ static void esp_zb_task(void *pvParameters) {
         add_analog_endpoint(ep_list, (uint8_t)(ENDPOINT_BASE + i), channels[i].description);
     }
     esp_zb_device_register(ep_list);
+    configure_reporting();
 
     esp_zb_set_primary_network_channel_set(ESP_ZB_PRIMARY_CHANNEL_MASK);
     ESP_ERROR_CHECK(esp_zb_start(false));
