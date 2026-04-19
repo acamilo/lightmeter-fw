@@ -14,10 +14,26 @@
 #include "esp_timer.h"
 #include "nvs_flash.h"
 
+#include "esp_app_desc.h"
+#include "esp_ota_ops.h"
+#include "esp_system.h"
 #include "esp_zigbee_core.h"
 #include "ha/esp_zigbee_ha_standard.h"
 
 #include "as7341.h"
+
+// --- OTA parameters ---------------------------------------------------------
+//
+// These three values must match what the OTA image header advertises.
+// Zigbee Alliance assigns manufacturer codes to commercial vendors — we're
+// a hobby project, so we pick a fixed value in the "unused" space and stick
+// with it. Changing any of these after devices are deployed orphans them
+// from future updates.
+#define LIGHTMETER_MANUFACTURER  0x1289
+#define LIGHTMETER_IMAGE_TYPE    0x0001
+#define LIGHTMETER_FW_VERSION    0x00000001   // bump for each release
+
+static void mark_image_valid_once(void);
 
 static const char *TAG = "lightmeter";
 
@@ -185,6 +201,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
                 ESP_LOGI(TAG, "Rejoined network: PAN=0x%04x ch=%d short=0x%04x",
                          esp_zb_get_pan_id(), esp_zb_get_current_channel(),
                          esp_zb_get_short_address());
+                mark_image_valid_once();
             }
         } else {
             ESP_LOGW(TAG, "Commissioning init failed (%s), retrying in 1s",
@@ -197,6 +214,7 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
             ESP_LOGI(TAG, "Joined network: PAN=0x%04x ch=%d short=0x%04x",
                      esp_zb_get_pan_id(), esp_zb_get_current_channel(),
                      esp_zb_get_short_address());
+            mark_image_valid_once();
         } else {
             ESP_LOGW(TAG, "Steering failed (%s), retrying in 5s", esp_err_to_name(err_status));
             esp_zb_scheduler_alarm(start_network_steering, 0, 5000);
@@ -208,6 +226,101 @@ void esp_zb_app_signal_handler(esp_zb_app_signal_t *signal_struct) {
                  esp_err_to_name(err_status));
         break;
     }
+}
+
+// --- OTA client ---------------------------------------------------------------
+
+static const esp_partition_t *s_ota_partition = NULL;
+static esp_ota_handle_t       s_ota_handle    = 0;
+static uint32_t               s_ota_written   = 0;
+static bool                   s_running_image_validated = false;
+
+static void add_ota_cluster_to(esp_zb_cluster_list_t *cluster_list) {
+    esp_zb_ota_cluster_cfg_t ota_cfg = {
+        .ota_upgrade_file_version         = LIGHTMETER_FW_VERSION,
+        .ota_upgrade_manufacturer         = LIGHTMETER_MANUFACTURER,
+        .ota_upgrade_image_type           = LIGHTMETER_IMAGE_TYPE,
+        .ota_min_block_reque              = 0,
+        .ota_upgrade_file_offset          = ESP_ZB_ZCL_OTA_UPGRADE_FILE_OFFSET_DEF_VALUE,
+        .ota_upgrade_downloaded_file_ver  = ESP_ZB_ZCL_OTA_UPGRADE_FILE_VERSION_DEF_VALUE,
+        .ota_upgrade_server_id            = { 0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff },
+        .ota_image_upgrade_status         = ESP_ZB_ZCL_OTA_UPGRADE_IMAGE_STATUS_DEF_VALUE,
+    };
+    esp_zb_cluster_list_add_ota_cluster(
+        cluster_list, esp_zb_ota_cluster_create(&ota_cfg),
+        ESP_ZB_ZCL_CLUSTER_CLIENT_ROLE);
+}
+
+// Called by the Zigbee stack on every OTA upgrade-state transition.
+// Flow matches the esp-zigbee-sdk OTA example: open partition on START,
+// stream chunks on RECEIVE, finalize + swap partitions + reboot on FINISH.
+static esp_err_t zb_core_action_handler(esp_zb_core_action_callback_id_t callback_id,
+                                        const void *message) {
+    if (callback_id != ESP_ZB_CORE_OTA_UPGRADE_VALUE_CB_ID) {
+        return ESP_OK;
+    }
+    const esp_zb_zcl_ota_upgrade_value_message_t *m = message;
+    switch (m->upgrade_status) {
+    case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_START:
+        s_ota_partition = esp_ota_get_next_update_partition(NULL);
+        if (!s_ota_partition) {
+            ESP_LOGE(TAG, "OTA: no next update partition");
+            return ESP_FAIL;
+        }
+        if (esp_ota_begin(s_ota_partition, OTA_SIZE_UNKNOWN, &s_ota_handle) != ESP_OK) {
+            ESP_LOGE(TAG, "OTA: esp_ota_begin failed");
+            return ESP_FAIL;
+        }
+        s_ota_written = 0;
+        ESP_LOGI(TAG, "OTA: starting download to partition %s", s_ota_partition->label);
+        break;
+    case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_RECEIVE:
+        if (esp_ota_write(s_ota_handle, m->payload, m->payload_size) != ESP_OK) {
+            ESP_LOGE(TAG, "OTA: write failed at offset %" PRIu32, s_ota_written);
+            return ESP_FAIL;
+        }
+        s_ota_written += m->payload_size;
+        if ((s_ota_written & 0x3FFF) < m->payload_size) {   // log every ~16 KB
+            ESP_LOGI(TAG, "OTA: received %" PRIu32 " bytes", s_ota_written);
+        }
+        break;
+    case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_APPLY:
+        ESP_LOGI(TAG, "OTA: apply request accepted");
+        break;
+    case ESP_ZB_ZCL_OTA_UPGRADE_STATUS_FINISH:
+        if (esp_ota_end(s_ota_handle) != ESP_OK) {
+            ESP_LOGE(TAG, "OTA: esp_ota_end failed (image invalid?)");
+            return ESP_FAIL;
+        }
+        if (esp_ota_set_boot_partition(s_ota_partition) != ESP_OK) {
+            ESP_LOGE(TAG, "OTA: set_boot_partition failed");
+            return ESP_FAIL;
+        }
+        ESP_LOGI(TAG, "OTA: %" PRIu32 " bytes written, rebooting into new image", s_ota_written);
+        vTaskDelay(pdMS_TO_TICKS(500));
+        esp_restart();
+        break;
+    default:
+        ESP_LOGI(TAG, "OTA: status 0x%04x", m->upgrade_status);
+        break;
+    }
+    return ESP_OK;
+}
+
+// Once we're up and joined, mark the current image valid so the bootloader
+// stops holding it in the rollback-pending state. Called from the signal
+// handler after a successful steering or rejoin.
+static void mark_image_valid_once(void) {
+    if (s_running_image_validated) return;
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_img_states_t state;
+    if (esp_ota_get_state_partition(running, &state) != ESP_OK) return;
+    if (state == ESP_OTA_IMG_PENDING_VERIFY) {
+        if (esp_ota_mark_app_valid_cancel_rollback() == ESP_OK) {
+            ESP_LOGI(TAG, "OTA: marked running image valid, rollback cancelled");
+        }
+    }
+    s_running_image_validated = true;
 }
 
 // Add Basic + Identify to a cluster list. All our endpoints want both.
@@ -346,6 +459,18 @@ static void esp_zb_task(void *pvParameters) {
             add_binary_endpoint(ep_list, ep_id, channels[i].description);
         }
     }
+
+    // Add OTA Upgrade (0x0019) client cluster to EP 1 so the coordinator can
+    // push firmware updates. Convention: OTA sits on the first endpoint.
+    {
+        esp_zb_endpoint_config_t ep1_cfg;  // only consulted for placement lookup
+        (void)ep1_cfg;
+        esp_zb_cluster_list_t *ep1_clusters =
+            esp_zb_ep_list_get_ep(ep_list, ENDPOINT_BASE);
+        if (ep1_clusters) add_ota_cluster_to(ep1_clusters);
+    }
+
+    esp_zb_core_action_handler_register(zb_core_action_handler);
     esp_zb_device_register(ep_list);
     configure_reporting();
 
@@ -444,7 +569,10 @@ static void sensor_task(void *pvParameters) {
 // --- Boot --------------------------------------------------------------------
 
 void app_main(void) {
-    ESP_LOGI(TAG, "lightmeter boot — %d endpoints (10 analog + 2 binary + NIR)", NUM_CHANNELS);
+    ESP_LOGI(TAG, "lightmeter boot — %d endpoints (11 analog + 2 binary) + OTA, fw=0x%08x",
+             NUM_CHANNELS, (unsigned)LIGHTMETER_FW_VERSION);
+    const esp_app_desc_t *app = esp_app_get_description();
+    if (app) ESP_LOGI(TAG, "built %s %s, idf=%s", app->date, app->time, app->idf_ver);
 
     ESP_ERROR_CHECK(nvs_flash_init());
 

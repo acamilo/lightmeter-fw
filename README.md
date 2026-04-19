@@ -67,6 +67,47 @@ ts_ms,F1 415nm PPFD umol/m2/s,F2 445nm PPFD umol/m2/s, ... ,PAR total PPFD umol/
 
 Useful for sanity-checking without pairing to a ZHA coordinator.
 
+## Over-the-air updates
+
+The device advertises the standard **OTA Upgrade cluster (0x0019)** as a client on endpoint 1, with dual-slot `ota_0`/`ota_1` partitions and bootloader rollback enabled. ZHA, Zigbee2MQTT, and any other ZCL OTA server can push new firmware without a USB cable.
+
+**Identity** (must match between the device and the `.ota` file):
+
+| Field | Value |
+|---|---|
+| Manufacturer code | `0x1289` |
+| Image type | `0x0001` |
+| Current file version | `0x00000001` (bump in `main/main.c` each release) |
+
+### Build and package an update
+
+```
+idf.py build
+scripts/make_ota.py build/lightmeter.bin lightmeter-v2.ota \
+    --manufacturer 0x1289 --image-type 0x0001 --version 0x00000002
+```
+
+`make_ota.py` wraps the ESP-IDF `.bin` in the ZCL OTA Upgrade File format (header + `Upgrade Image` sub-element). Bump `--version` for every release — the coordinator serves only images strictly newer than what the device reports.
+
+### Deploying via ZHA
+
+1. Place `lightmeter-v2.ota` in `<HA config>/zigbee_ota/` (or wherever your `zha.configuration.ota_providers` points).
+2. Restart HA or reload the ZHA integration.
+3. ZHA announces the new image; the device downloads over the air and reboots into it. Expect **15–30 minutes** on a healthy mesh for a ~500 KB image.
+
+### Deploying via Zigbee2MQTT
+
+1. Drop the `.ota` into the path set by the `ota.image_block_response_delay` / `ota.custom_files` config (see z2m OTA docs).
+2. Trigger an OTA check from the z2m UI.
+
+### Rollback
+
+If the new image fails to rejoin the network within a reasonable time, the bootloader reverts to the previous image on the next reset (`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE`). A bricked update un-bricks itself on next power cycle. Once the new firmware rejoins successfully, it calls `esp_ota_mark_app_valid_cancel_rollback()` and becomes the permanent image.
+
+### First-time flash
+
+The factory-flashed image must come via USB — partition layout changed from single `factory` to dual OTA slots. After that, OTA handles everything.
+
 ## Calibration TODO
 
 Per-band responsivity coefficients (`responsivity_basic[]` in `main/main.c`) are AS7341 datasheet-typical values normalized into the k0i05 basic-counts domain — expect accuracy within a factor of ~2. For anything better, single-point-calibrate each band against a reference meter (Apogee MQ-500 / LI-COR LI-250 / similar) under a known PAR source, then scale each `responsivity_basic[i]` by `(firmware_umol / reference_umol)`.
