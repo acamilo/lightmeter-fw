@@ -31,7 +31,10 @@
 // from future updates.
 #define LIGHTMETER_MANUFACTURER  0x1289
 #define LIGHTMETER_IMAGE_TYPE    0x0001
-#define LIGHTMETER_FW_VERSION    0x00000006   // bump for each release
+#define LIGHTMETER_FW_VERSION    0x00000007   // bump for each release
+// One-line boot banner we can grep for to confirm an OTA actually took
+// effect. Update this string each release.
+#define LIGHTMETER_RELEASE_TAG   "fw-v7-ota-test"
 
 // Shown in ZHA's "Manage Device" view and used by the matching quirk. These
 // are ZCL character strings so they get the usual length-byte prefix in RAM;
@@ -689,8 +692,8 @@ static void sensor_task(void *pvParameters) {
 // --- Boot --------------------------------------------------------------------
 
 void app_main(void) {
-    ESP_LOGI(TAG, "lightmeter boot — %d endpoints (11 analog + 2 binary) + OTA, fw=0x%08x",
-             NUM_CHANNELS, (unsigned)LIGHTMETER_FW_VERSION);
+    ESP_LOGI(TAG, "lightmeter boot [%s] — %d endpoints (11 analog + 2 binary) + OTA, fw=0x%08x",
+             LIGHTMETER_RELEASE_TAG, NUM_CHANNELS, (unsigned)LIGHTMETER_FW_VERSION);
     const esp_app_desc_t *app = esp_app_get_description();
     if (app) ESP_LOGI(TAG, "built %s %s, idf=%s", app->date, app->time, app->idf_ver);
 
